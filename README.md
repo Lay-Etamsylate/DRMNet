@@ -22,7 +22,17 @@ An overview of the proposed DRMNet. DRMNet is an end-to-end neural network with 
 <img width="1377" height="746" alt="fig2" src="https://github.com/user-attachments/assets/a13b0563-c21b-48c1-ad85-81df805dd304" />
 
 ## Citations
-If you are using the code/model/data provided here in a publication, please consider citing
+If you are using the code/model/data provided here in a publication, please consider citing:
+```bibtex
+@inproceedings{lan2025domain,
+  title={Domain Generalization for Pulmonary Nodule Detection via Distributionally-Regularized Mamba},
+  author={Lan, Tianzhong and Chen, Nan and Yi, Zhang and Xu, Xiuyuan and Zhu, Min},
+  booktitle={International Conference on Medical Image Computing and Computer-Assisted Intervention},
+  pages={152--162},
+  year={2025},
+  organization={Springer}
+}
+```
 
 ## Contact
 For any questions, please contact me via e-mail: lantianzhong1@stu.scu.edu.cn.
