@@ -290,8 +290,14 @@ class Crop(object):
         if isScale:
             radiusLim = [8.,120.]
             scaleLim = [0.75,1.25]
-            scaleRange = [np.min([np.max([(radiusLim[0]/target[3]),scaleLim[0]]),1])
-                         ,np.max([np.min([(radiusLim[1]/target[3]),scaleLim[1]]),1])]
+            target_size = max(
+                target[1] - target[0],
+                target[3] - target[2],
+                target[5] - target[4],
+                1.0,
+            )
+            scaleRange = [np.min([np.max([(radiusLim[0]/target_size),scaleLim[0]]),1])
+                         ,np.max([np.min([(radiusLim[1]/target_size),scaleLim[1]]),1])]
             scale = np.random.rand()*(scaleRange[1]-scaleRange[0])+scaleRange[0]
             crop_size = (np.array(self.crop_size).astype('float')/scale).astype('int')
         else:
@@ -318,7 +324,12 @@ class Crop(object):
             if s>e:
                 start.append(np.random.randint(e,s))#!
             else:
-                start.append(int(target[i])-int(crop_size[i]/2)+np.random.randint(-bound_size/2,bound_size/2))
+                center = (target[j] + target[j + 1]) / 2.0
+                start.append(
+                    int(center)
+                    - int(crop_size[i] / 2)
+                    + np.random.randint(-bound_size // 2, bound_size // 2)
+                )
 
         normstart = np.array(start).astype('float32')/np.array(imgs.shape[1:])-0.5
         normsize = np.array(crop_size).astype('float32')/np.array(imgs.shape[1:])
@@ -368,4 +379,3 @@ class Crop(object):
                 for j in range(6):
                     bboxes[i][j] = bboxes[i][j]*scale
         return crop, target, bboxes, coord
-

@@ -39,10 +39,12 @@ def rpn_nms(cfg, mode, inputs, window, logits_flat, deltas_flat):
     if mode in ['train',]:
         nms_pre_score_threshold = cfg['rpn_train_nms_pre_score_threshold']
         nms_overlap_threshold   = cfg['rpn_train_nms_overlap_threshold']
+        nms_num = cfg['rpn_train_nms_num']
 
     elif mode in ['eval', 'valid', 'test',]:
         nms_pre_score_threshold = cfg['rpn_test_nms_pre_score_threshold']
         nms_overlap_threshold   = cfg['rpn_test_nms_overlap_threshold']
+        nms_num = cfg.get('rpn_test_nms_num', cfg['rpn_train_nms_num'])
 
     else:
         raise ValueError('rpn_nms(): invalid mode = %s?'%mode)
@@ -73,6 +75,7 @@ def rpn_nms(cfg, mode, inputs, window, logits_flat, deltas_flat):
 
             output = torch.from_numpy(output)
             output, keep = torch_nms(output, nms_overlap_threshold)
+            output = output[:nms_num]
 
             prop = np.zeros((len(output), 8),np.float32)
             prop[:, 0] = b

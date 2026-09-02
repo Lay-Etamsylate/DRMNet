@@ -64,6 +64,7 @@ net_config = {
     'rpn_train_nms_overlap_threshold': 0.1,
     'rpn_test_nms_pre_score_threshold': 0.5,
     'rpn_test_nms_overlap_threshold': 0.1,
+    'rpn_test_nms_num': 300,
 
     # false positive reduction network configuration
     'num_class': len(data_config['roi_names']) + 1,
