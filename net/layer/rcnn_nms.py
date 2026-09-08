@@ -115,11 +115,10 @@ def get_probability(cfg, mode, inputs, proposals, logits, deltas):
         raise ValueError('rcnn_nms(): invalid mode = %s?'%mode)
 
     num_class = cfg['num_class']
-    probs = F.softmax(logits, dim=1).cpu().data.numpy()
+    probs = F.softmax(logits).cpu().data.numpy()
     deltas = deltas.cpu().data.numpy().reshape(-1, num_class, 6)
     proposals = proposals.cpu().data.numpy()
 
-    output = np.empty((0, 8), dtype=np.float32)
     for j in range(1, num_class):  # skip background
         idx = np.where(probs[:, j] > nms_pre_score_threshold)[0]
         if len(idx) > 0:
@@ -130,7 +129,7 @@ def get_probability(cfg, mode, inputs, proposals, logits, deltas):
             js = np.expand_dims(np.array([j] * len(p)), axis=-1)
             output = np.concatenate((p, box, js), 1)
 
-    return torch.from_numpy(output).to(inputs.device).float()
+    return torch.from_numpy(output).cuda().float()
 
 
 #-----------------------------------------------------------------------------  

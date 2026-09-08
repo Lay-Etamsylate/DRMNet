@@ -1,6 +1,3 @@
-import numpy as np
-import torch
-
 try:
     from utils.pybox import *
 except ImportError:

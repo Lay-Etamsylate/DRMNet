@@ -1,6 +1,6 @@
 from net.sanet import SANet
 import time
-from dataset.collate import domain_train_collate, train_collate, test_collate, eval_collate
+from dataset.collate import train_collate, test_collate, eval_collate
 from dataset.bbox_reader import BboxReader
 from utils.util import Logger
 from config import train_config, data_config, net_config, config
@@ -60,16 +60,8 @@ parser.add_argument('--train-data-dir', default=train_config['train_dir'], nargs
                     help='path to load data')
 parser.add_argument('--val-data-dir', default=train_config['val_dir'],  nargs='+', type=str,
                     help='path to load data')
-parser.add_argument('--train-anno', default=train_config['train_anno'], nargs='+', type=str,
-                    help='training annotation CSV paths, aligned with --train-data-dir')
-parser.add_argument('--val-anno', default=train_config['val_anno'], nargs='+', type=str,
-                    help='validation annotation CSV paths, aligned with --val-data-dir')
 parser.add_argument('--num-workers', default=train_config['num_workers'], type=int, metavar='N',
                     help='number of data loading workers')
-parser.add_argument('--max-train-batches', default=None, type=int,
-                    help='optional batch limit for a short pipeline smoke test')
-parser.add_argument('--max-val-batches', default=None, type=int,
-                    help='optional validation batch limit for a short pipeline smoke test')
 
 
 def main():
@@ -92,45 +84,29 @@ def main():
     val_data_dir = args.val_data_dir
     train_set_list = args.train_set
     val_set_list = args.val_set
-    train_anno_list = args.train_anno
-    val_anno_list = args.val_anno
     train_dataset_list = []
     val_dataset_list = []
 
-    if not (len(train_data_dir) == len(train_set_list) == len(train_anno_list)):
-        raise ValueError('--train-data-dir, --train-set and --train-anno must have equal lengths')
-    if not (len(val_data_dir) == len(val_set_list) == len(val_anno_list)):
-        raise ValueError('--val-data-dir, --val-set and --val-anno must have equal lengths')
-
     #oversample
     max_num = 0
-    for item in train_anno_list:
+    for item in config['train_anno']:
         annos_all = pd.read_csv(item)
         if annos_all.shape[0]>max_num:
             max_num = annos_all.shape[0]
     
     #ensure the alignment of data_source and filelist
     for index in range(len(train_set_list)):
-        train_dataset = BboxReader(train_data_dir[index], train_set_list[index], train_anno_list[index], config, max_num, mode='train')
+        train_dataset = BboxReader(train_data_dir[index], args.train_set[index], config['train_anno'][index], config, max_num, mode='train')
         train_dataset_list.append(train_dataset)
     for index in range(len(val_set_list)):
-        val_dataset = BboxReader(val_data_dir[index], val_set_list[index], val_anno_list[index], config, max_num, mode='val')
+        val_dataset = BboxReader(val_data_dir[index], args.val_set[index], config['val_anno'][index], config, max_num, mode='val')
         val_dataset_list.append(val_dataset)
 
-    if len(train_dataset_list) == 1:
-        total_train_dataset = train_dataset_list[0]
-        collate_fn = train_collate
-    else:
-        total_train_dataset = StackDataset(*train_dataset_list)
-        collate_fn = domain_train_collate
-
-    total_val_dataset = (
-        val_dataset_list[0]
-        if len(val_dataset_list) == 1
-        else ConcatDataset(val_dataset_list)
-    )
+    total_train_dataset = StackDataset(*train_dataset_list)
+        
+    total_val_dataset = ConcatDataset(val_dataset_list)
     train_loader = DataLoader(total_train_dataset, batch_size=batch_size, shuffle=True,
-                              num_workers=args.num_workers, pin_memory=True, collate_fn=collate_fn)
+                              num_workers=args.num_workers, pin_memory=True, collate_fn=train_collate)
     val_loader = DataLoader(total_val_dataset, batch_size=batch_size, shuffle=False,
                               num_workers=args.num_workers, pin_memory=True, collate_fn=eval_collate)
 
@@ -210,8 +186,8 @@ def main():
             net.use_rcnn = False
 
         print('[epoch %d, lr %f, use_rcnn: %r]' % (i, lr, net.use_rcnn))
-        train(net, train_loader, optimizer, i, train_writer, args.max_train_batches)
-        validate(net, val_loader, i, val_writer, args.max_val_batches)
+        train(net, train_loader, optimizer, i, train_writer)
+        validate(net, val_loader, i, val_writer)
 
 
         state_dict = net.state_dict()
@@ -231,7 +207,7 @@ def main():
     val_writer.close()
 
 
-def train(net, train_loader, optimizer, epoch, writer, max_batches=None):
+def train(net, train_loader, optimizer, epoch, writer):
     net.set_mode('train')
     s = time.time()
     rpn_cls_loss, rpn_reg_loss = [], []
@@ -291,9 +267,6 @@ def train(net, train_loader, optimizer, epoch, writer, max_batches=None):
         if net.use_rcnn:
             del net.rcnn_logits, net.rcnn_deltas
 
-        if max_batches is not None and (j + 1) >= max_batches:
-            break
-
     torch.cuda.empty_cache()
 
     rpn_stats = np.asarray(rpn_stats, np.float32)
@@ -351,7 +324,7 @@ def train(net, train_loader, optimizer, epoch, writer, max_batches=None):
         writer.add_scalar('rcnn_reg_w', np.mean(rcnn_stats[:, 5]), epoch)
     
 
-def validate(net, val_loader, epoch, writer, max_batches=None):
+def validate(net, val_loader, epoch, writer):
     net.set_mode('valid')
     rpn_cls_loss, rpn_reg_loss = [], []
     rcnn_cls_loss, rcnn_reg_loss = [], []
@@ -379,9 +352,6 @@ def validate(net, val_loader, epoch, writer, max_batches=None):
         total_loss.append(loss.item())
         rpn_stats.append(rpn_stat)
         rcnn_stats.append(rcnn_stat)
-
-        if max_batches is not None and (j + 1) >= max_batches:
-            break
 
     rpn_stats = np.asarray(rpn_stats, np.float32)
     print('Val Epoch %d, iter %d, total time %f, loss %f' % (epoch, j, time.time()-s, np.average(total_loss)))
@@ -454,4 +424,6 @@ def print_confusion_matrix(confusion_matrix):
 
 if __name__ == '__main__':
     main()
+
+
 
