@@ -11,8 +11,8 @@ from utils.util import center_box_to_coord_box, ext2factor, clip_boxes
 from torch.nn.parallel import data_parallel
 import random
 from scipy.stats import norm
-from net import resnet, cgnl
-from mamba_ssm import Mamba
+from net.feature_net import FeatureNet
+from net.heads import RpnHead, RcnnHead
 
 bn_momentum = 0.1
 affine = True
@@ -47,154 +47,6 @@ class ResBlock3d(nn.Module):
         out = self.relu(out)
         return out
 
-
-class FeatureNet(nn.Module):
-    def __init__(self, config):
-        super(FeatureNet, self).__init__()
-        self.resnet50 = resnet.resnet50()
-
-        self.back1 = nn.Sequential(
-            nn.Conv3d(256, 128, kernel_size=3, padding=1, stride=1),
-            nn.BatchNorm3d(128, momentum=bn_momentum),
-            nn.ReLU(inplace=True))
-
-        self.back2 = nn.Sequential(
-            nn.Conv3d(128, 128, kernel_size=3, padding=1, stride=1),
-            nn.BatchNorm3d(128, momentum=bn_momentum),
-            nn.ReLU(inplace=True))
-
-        self.back3 = nn.Sequential(
-            nn.Conv3d(128, 64, kernel_size=3, padding=1, stride=1),
-            nn.BatchNorm3d(64, momentum=bn_momentum),
-            nn.ReLU(inplace=True))
-
-        # upsampling
-        self.reduce1 = nn.Sequential(
-            nn.Conv3d(64, 64, kernel_size=1, stride=1),
-            nn.BatchNorm3d(64, momentum=bn_momentum),
-            nn.ReLU(inplace=True))
-
-        self.path1 = nn.Sequential(
-            nn.ConvTranspose3d(64, 64, kernel_size=2, stride=2),
-            nn.BatchNorm3d(64),
-            nn.ReLU(inplace=True))
-
-        self.reduce2 = nn.Sequential(
-            nn.Conv3d(64, 64, kernel_size=1, stride=1),
-            nn.BatchNorm3d(64, momentum=bn_momentum),
-            nn.ReLU(inplace=True))
-
-        # upsampling
-        self.path2 = nn.Sequential(
-            nn.ConvTranspose3d(64, 64, kernel_size=2, stride=2),
-            nn.BatchNorm3d(64),
-            nn.ReLU(inplace=True))
-
-        self.reduce3 = nn.Sequential(
-            nn.Conv3d(64, 64, kernel_size=1, stride=1),
-            nn.BatchNorm3d(64, momentum=bn_momentum),
-            nn.ReLU(inplace=True))
-
-        self.path3 = nn.Sequential(
-            nn.ConvTranspose3d(128, 128, kernel_size=2, stride=2),
-            nn.BatchNorm3d(128),
-            nn.ReLU(inplace=True))
-
-        self.reduce4 = nn.Sequential(
-            nn.Conv3d(256, 128, kernel_size=1, stride=1),
-            nn.BatchNorm3d(128, momentum=bn_momentum),
-            nn.ReLU(inplace=True))
-        #mamba
-        self.ln1 = nn.LayerNorm(64)
-        self.mamba1 = Mamba(
-                        d_model=64,
-                        d_state=16,  
-                        d_conv=4,    
-                        expand=2,   
-                    )
-        self.ln2 = nn.LayerNorm(128)
-        self.mamba2 = Mamba(
-                        d_model=128,
-                        d_state=16,  
-                        d_conv=4,    
-                        expand=2,   
-                    )
-
-    def forward(self, x):
-        x1, out1, out2, out3, out4 = self.resnet50(x)
-        out4 = self.reduce1(out4)
-        rev3 = self.path1(out4)
-        B, C = rev3.shape[:2]
-        n_tokens = rev3.shape[2:].numel()
-        img_dims = rev3.shape[2:]
-        rev3_feature_flat = rev3.view(B, C, n_tokens).transpose(-1, -2)
-        rev3_feature_flat = self.ln1(rev3_feature_flat)
-        rev3 = self.mamba1(rev3_feature_flat)
-        rev3 = rev3.transpose(-1, -2).view(B, C, *img_dims)
-        
-        out3 = self.reduce2(out3)
-        comb3 = self.back3(torch.cat((rev3, out3), 1))
-        
-        rev2 = self.path2(comb3)
-        B, C = rev2.shape[:2]
-        n_tokens = rev2.shape[2:].numel()
-        img_dims = rev2.shape[2:]
-        rev2_feature_flat = rev2.view(B, C, n_tokens).transpose(-1, -2)
-        rev2_feature_flat = self.ln1(rev2_feature_flat)
-        rev2 = self.mamba1(rev2_feature_flat)
-        rev2 = rev2.transpose(-1, -2).view(B, C, *img_dims)
-        
-        out2 = self.reduce3(out2)
-        comb2 = self.back2(torch.cat((rev2, out2), 1))
-       
-        return [x1, out1, comb2], out1
-
-class RpnHead(nn.Module):
-    def __init__(self, config, in_channels=128):
-        super(RpnHead, self).__init__()
-        self.drop = nn.Dropout3d(p=0.5, inplace=False)
-        self.conv = nn.Sequential(nn.Conv3d(in_channels, 64, kernel_size=1),
-                                    nn.ReLU())
-        self.logits = nn.Conv3d(64, 1 * len(config['anchors']), kernel_size=1)
-        self.deltas = nn.Conv3d(64, 6 * len(config['anchors']), kernel_size=1)
-
-    def forward(self, f):
-        # out = self.drop(f)
-        out = self.conv(f)
-
-        logits = self.logits(out)
-        deltas = self.deltas(out)
-        size = logits.size()
-        logits = logits.view(logits.size(0), logits.size(1), -1)
-        logits = logits.transpose(1, 2).contiguous().view(size[0], size[2], size[3], size[4], len(config['anchors']), 1)
-        
-        size = deltas.size()
-        deltas = deltas.view(deltas.size(0), deltas.size(1), -1)
-        deltas = deltas.transpose(1, 2).contiguous().view(size[0], size[2], size[3], size[4], len(config['anchors']), 6)
-        
-
-        return logits, deltas
-
-class RcnnHead(nn.Module):
-    def __init__(self, cfg, in_channels=128):
-        super(RcnnHead, self).__init__()
-        self.num_class = cfg['num_class']
-        self.crop_size = cfg['rcnn_crop_size']
-
-        self.fc1 = nn.Linear(in_channels * self.crop_size[0] * self.crop_size[1] * self.crop_size[2], 512)
-        self.fc2 = nn.Linear(512, 256)
-        self.logit = nn.Linear(256, self.num_class)
-        self.delta = nn.Linear(256, self.num_class * 6)
-
-    def forward(self, crops):
-        x = crops.view(crops.size(0), -1)
-        x = F.relu(self.fc1(x), inplace=True)
-        x = F.relu(self.fc2(x), inplace=True)
-        # x = F.dropout(x, 0.5, training=self.training)
-        logits = self.logit(x)
-        deltas = self.delta(x)
-
-        return logits, deltas
 
 class MaskHead(nn.Module):
     def __init__(self, cfg, in_channels=128):
@@ -385,9 +237,9 @@ class SANet(nn.Module):
 
         self.cfg = cfg
         self.mode = mode
-        self.feature_net = FeatureNet(config)
-        self.rpn = RpnHead(config, in_channels=128)
-        self.rcnn_head = RcnnHead(config, in_channels=64)
+        self.feature_net = FeatureNet(cfg)
+        self.rpn = RpnHead(cfg, in_channels=128)
+        self.rcnn_head = RcnnHead(cfg, in_channels=64)
         self.rcnn_crop = CropRoi(self.cfg, cfg['rcnn_crop_size'])
         self.use_rcnn = False
          #lddg
@@ -571,4 +423,3 @@ if __name__ == '__main__':
     input = torch.rand([2,1,304,384,384])
     input = Variable(input)
     net(input, None, None)
-

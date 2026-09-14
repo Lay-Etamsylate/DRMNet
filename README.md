@@ -4,6 +4,14 @@ This paper has been accepted for presentation at MICCAI 2025. And our code is ba
 
 This code is licensed for non-commercial research purposes only.
 
+## Optional 3D fusion experiments
+
+Detection-oriented adaptations of MedSegMamba and FreqFusion are available as
+`baseline`, `mamba`, `freqfusion`, and `fusion` architecture variants. These are
+experimental adaptations, not reproductions of the upstream networks. No LUNA16
+recall improvement has yet been measured. See [the fusion guide](docs/fusion.md)
+for design differences, sources, L20 smoke checks, training and evaluation commands.
+
 ## Contributions
 
 We propose the FASS module to incorporate global features by leveraging the spatial relationship between pulmonary nodules and vascular structures to integrate global features. 

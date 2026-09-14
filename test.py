@@ -20,6 +20,7 @@ from net.sanet import SANet
 from dataset.collate import train_collate, test_collate, eval_collate
 from dataset.bbox_reader import BboxReader
 from config import config
+from net.model_config import VARIANTS, checkpoint_model_config
 import pandas as pd
 from evaluationScript.noduleCADEvaluationLUNA16 import noduleCADEvaluation
 
@@ -29,6 +30,15 @@ this_module = sys.modules[__name__]
 parser = argparse.ArgumentParser()
 parser.add_argument('--net', '-m', metavar='NET', default=config['net'],
                     help='neural net')
+parser.add_argument('--variant', choices=VARIANTS, default=None,
+                    help='optional assertion; architecture is restored from checkpoint')
+parser.add_argument('--test-anno', type=str, default=config['val_anno'][0],
+                    help='annotation CSV used by the evaluation dataset reader')
+parser.add_argument('--froc-annotations', default='/data/ltz-dg/filelist/annotations/annotations-luna16-lungseg.csv',
+                    help='ground-truth CSV in the coordinate system used by the FROC evaluator')
+parser.add_argument('--froc-excluded', default='/data/ltz-dg/filelist/annotations/luna16_excluded.csv')
+parser.add_argument('--froc-seriesuids', default='/data/ltz-dg/filelist/annotations/seriesuids-luna16-lungseg.csv',
+                    help='seriesuid CSV restricted to the evaluated split')
 parser.add_argument("--mode", type=str, default = 'eval',
                     help="you want to test or val")
 parser.add_argument("--weight", type=str, default='./results/model/model.ckpt',
@@ -57,15 +67,14 @@ def main():
         net = args.net
         out_dir = args.out_dir
 
-        net = getattr(this_module, net)(config)
-        net = net.cuda()
-
         if initial_checkpoint:
             print('[Loading model from %s]' % initial_checkpoint)
-            checkpoint = torch.load(initial_checkpoint)
+            checkpoint = torch.load(initial_checkpoint, map_location='cpu')
             epoch = checkpoint['epoch']
-
-            net.load_state_dict(checkpoint['state_dict'])
+            eval_cfg = checkpoint_model_config(config, checkpoint, args.variant)
+            net = getattr(this_module, net)(eval_cfg).cuda()
+            net.load_state_dict(checkpoint['state_dict'], strict=True)
+            print('Model variant:', eval_cfg['model_variant'])
         else:
             print('No model weight file specified')
             return
@@ -77,11 +86,12 @@ def main():
         if not os.path.exists(os.path.join(save_dir, 'FROC')):
             os.makedirs(os.path.join(save_dir, 'FROC'))
 
-        dataset = BboxReader(data_dir, test_set_name, config['val_anno'][0], config, 0, mode='eval')
+        dataset = BboxReader(data_dir, test_set_name, args.test_anno, eval_cfg, 0, mode='eval')
 #         test_loader = DataLoader(dataset, batch_size=1, shuffle=False,
 #                                  num_workers=num_workers, pin_memory=False, collate_fn=train_collate)
         eval(net, dataset, save_dir)
-        noduleCADEval(dataset, save_dir,epoch,out_dir,args.fold_num)
+        noduleCADEval(dataset, save_dir, epoch, out_dir, args.fold_num,
+                      args.froc_annotations, args.froc_excluded, args.froc_seriesuids)
     else:
         logging.error('Mode %s is not supported' % (args.mode))
 
@@ -192,7 +202,8 @@ def eval(net, dataset, save_dir):
     df = pd.DataFrame(ensemble_res, columns=col_names)
     df.to_csv(ensemble_submission_path, index=False)
     
-def noduleCADEval(dataset, save_dir,epoch,out_dir,fold_num):
+def noduleCADEval(dataset, save_dir, epoch, out_dir, fold_num,
+                  annotations_filename, annotation_exclude, val_path):
     eval_dir = os.path.join(save_dir, 'FROC')
     rpn_submission_path = os.path.join(eval_dir, 'submission_rpn.csv')
     rcnn_submission_path = os.path.join(eval_dir, 'submission_rcnn.csv')
@@ -205,10 +216,6 @@ def noduleCADEval(dataset, save_dir,epoch,out_dir,fold_num):
     if not os.path.exists(os.path.join(eval_dir, 'ensemble')):
         os.makedirs(os.path.join(eval_dir, 'ensemble'))
         
-    annotations_filename = '/data/ltz-dg/filelist/annotations/annotations-luna16-lungseg.csv'
-    val_path = '/data/ltz-dg/filelist/annotations/seriesuids-luna16-lungseg.csv'
-    annotation_exclude = '/data/ltz-dg/filelist/annotations/luna16_excluded.csv'
-    
     rpn_sens_boot,rpn_froc_boot,rpn_sens_norm,rpn_froc_norm = noduleCADEvaluation(annotations_filename,annotation_exclude,val_path, rpn_submission_path, os.path.join(eval_dir, 'rpn'))
 
     rcnn_sens_boot,rcnn_froc_boot,rcnn_sens_norm,rcnn_froc_norm = noduleCADEvaluation(annotations_filename,annotation_exclude,val_path, rcnn_submission_path, os.path.join(eval_dir, 'rcnn'))

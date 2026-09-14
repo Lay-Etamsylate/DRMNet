@@ -4,6 +4,7 @@ from dataset.collate import train_collate, test_collate, eval_collate
 from dataset.bbox_reader import BboxReader
 from utils.util import Logger
 from config import train_config, data_config, net_config, config
+from net.model_config import VARIANTS, build_model_config, checkpoint_model_config
 import pprint
 from torch.utils.data import DataLoader, StackDataset, ConcatDataset
 from torch.autograd import Variable
@@ -28,6 +29,8 @@ this_module = sys.modules[__name__]
 parser = argparse.ArgumentParser(description='PyTorch Detector')
 parser.add_argument('--net', '-m', metavar='NET', default=train_config['net'],
                     help='neural net')
+parser.add_argument('--variant', choices=VARIANTS, default=None,
+                    help='architecture ablation; default baseline, or restore from --ckpt')
 parser.add_argument('--epochs', default=train_config['epochs'], type=int, metavar='N',
                     help='number of total epochs to run')
 parser.add_argument('--batch-size', default=train_config['batch_size'], type=int, metavar='N',
@@ -52,6 +55,10 @@ parser.add_argument('--train-set', default=train_config['train_set_list'], nargs
                     help='train set paths list')
 parser.add_argument('--val-set', default=train_config['val_set_list'], nargs='+', type=str,
                     help='val set paths list')
+parser.add_argument('--train-anno', default=config['train_anno'], nargs='+',
+                    help='training annotation CSVs, one per source dataset')
+parser.add_argument('--val-anno', default=config['val_anno'], nargs='+',
+                    help='validation annotation CSVs, one per dataset')
 # parser.add_argument('--train-data-dir', default=train_config['train_dir'], type=str, metavar='OUT',
 #                     help='path to load data')
 # parser.add_argument('--val-data-dir', default=train_config['val_dir'], type=str, metavar='OUT',
@@ -67,6 +74,15 @@ parser.add_argument('--num-workers', default=train_config['num_workers'], type=i
 def main():
     # Load training configuration
     args = parser.parse_args()
+    resume = torch.load(args.ckpt, map_location='cpu') if args.ckpt else None
+    model_cfg = (checkpoint_model_config(net_config, resume, args.variant)
+                 if resume is not None else build_model_config(net_config, args.variant or 'baseline'))
+    data_cfg = dict(config, **model_cfg)
+    data_cfg['batch_size'] = args.batch_size
+    if not (len(args.train_set) == len(args.train_data_dir) == len(args.train_anno)):
+        parser.error('--train-set, --train-data-dir and --train-anno must have equal lengths')
+    if not (len(args.val_set) == len(args.val_data_dir) == len(args.val_anno)):
+        parser.error('--val-set, --val-data-dir and --val-anno must have equal lengths')
 
     net = args.net
     initial_checkpoint = args.ckpt
@@ -89,17 +105,17 @@ def main():
 
     #oversample
     max_num = 0
-    for item in config['train_anno']:
+    for item in args.train_anno:
         annos_all = pd.read_csv(item)
         if annos_all.shape[0]>max_num:
             max_num = annos_all.shape[0]
     
     #ensure the alignment of data_source and filelist
     for index in range(len(train_set_list)):
-        train_dataset = BboxReader(train_data_dir[index], args.train_set[index], config['train_anno'][index], config, max_num, mode='train')
+        train_dataset = BboxReader(train_data_dir[index], args.train_set[index], args.train_anno[index], data_cfg, max_num, mode='train')
         train_dataset_list.append(train_dataset)
     for index in range(len(val_set_list)):
-        val_dataset = BboxReader(val_data_dir[index], args.val_set[index], config['val_anno'][index], config, max_num, mode='val')
+        val_dataset = BboxReader(val_data_dir[index], args.val_set[index], args.val_anno[index], data_cfg, max_num, mode='val')
         val_dataset_list.append(val_dataset)
 
     total_train_dataset = StackDataset(*train_dataset_list)
@@ -120,7 +136,7 @@ def main():
     
     
     # Initilize network
-    net = getattr(this_module, net)(net_config)
+    net = getattr(this_module, net)(model_cfg)
     net = net.cuda()
     
     optimizer = getattr(torch.optim, optimizer)
@@ -130,18 +146,10 @@ def main():
 
     if initial_checkpoint:
         print('[Loading model from %s]' % initial_checkpoint)
-        checkpoint = torch.load(initial_checkpoint)
-        start_epoch = checkpoint['epoch']
-
-        state = net.state_dict()
-        state.update(checkpoint['state_dict'])
-
-        try:
-            net.load_state_dict(state)
-            optimizer.load_state_dict(checkpoint['optimizer'])
-        except:
-            print('Load something failed!')
-            traceback.print_exc()
+        start_epoch = resume['epoch']
+        net.load_state_dict(resume['state_dict'], strict=True)
+        optimizer.load_state_dict(resume['optimizer'])
+        del resume
 
     start_epoch = start_epoch + 1
     
@@ -160,7 +168,7 @@ def main():
         print(arg, getattr(args, arg))
 
     print('[Model configuration]')
-    pprint.pprint(net_config)
+    pprint.pprint(model_cfg)
 
     print('[start_epoch %d, out_dir %s]' % (start_epoch, out_dir))
     print('[length of train loader %d, length of valid loader %d]' % (len(train_loader), len(val_loader)))
@@ -198,6 +206,7 @@ def main():
             torch.save({
                 'epoch': i,
                 'out_dir': out_dir,
+                'model_config': model_cfg,
                 'state_dict': state_dict,
                 'optimizer' : optimizer.state_dict()},
                 os.path.join(model_out_dir, '%03d.ckpt' % i))
@@ -424,6 +433,4 @@ def print_confusion_matrix(confusion_matrix):
 
 if __name__ == '__main__':
     main()
-
-
 

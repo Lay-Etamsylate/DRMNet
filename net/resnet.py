@@ -4,8 +4,7 @@ import torch.nn.functional as F
 from torch.autograd import Variable
 import math
 from functools import partial
-from net import cgnl
-from mamba_ssm import Mamba
+from net.fusion_modules import MultiDirectionMamba3d, make_mamba
 
 __all__ = [
     'ResNet', 'resnet10', 'resnet18', 'resnet34', 'resnet50', 'resnet101',
@@ -116,7 +115,10 @@ class ResNet(nn.Module):
                  sample_size=None,
                  sample_duration=None,
                  shortcut_type='B',
-                 num_classes=400):
+                 num_classes=400,
+                 multidirection_stages=(),
+                 fusion_checkpoint=True,
+                 mamba_factory=None):
         self.inplanes = 64
         super(ResNet, self).__init__()
         self.conv1 = nn.Conv3d(
@@ -146,7 +148,8 @@ class ResNet(nn.Module):
         self.layer4 = self._make_layer(
             block, 64, layers[3], shortcut_type, stride=2)
         self.ln = nn.LayerNorm(64)
-        self.mamba = Mamba(
+        factory = mamba_factory or make_mamba
+        self.mamba = factory(
                         d_model=64,
                         d_state=16,  
                         d_conv=4,    
@@ -164,6 +167,16 @@ class ResNet(nn.Module):
                 # m.bias.data.zero_()
                 nn.init.constant_(m.weight, 1)
                 nn.init.constant_(m.bias, 0)
+
+        if any(stage not in (1, 2, 3, 4) for stage in multidirection_stages):
+            raise ValueError('multidirection_stages must contain encoder stages 1..4')
+        # Construct after legacy initialization so the original path and its
+        # checkpoint keys stay intact, and local block initialization is kept.
+        self.multidirection = nn.ModuleDict({
+            str(stage): MultiDirectionMamba3d(
+                64, use_checkpoint=fusion_checkpoint, mamba_factory=factory)
+            for stage in multidirection_stages
+        })
 
     def _make_layer(self, block, planes, blocks, shortcut_type, stride=1):
         downsample = None
@@ -205,53 +218,21 @@ class ResNet(nn.Module):
 
         return nn.Sequential(*layers)
 
+    def _context(self, x, stage):
+        if str(stage) in self.multidirection:
+            return self.multidirection[str(stage)](x)
+        b, c = x.shape[:2]
+        shape = x.shape[2:]
+        tokens = x.reshape(b, c, -1).transpose(1, 2)
+        tokens = self.mamba(self.ln(tokens))
+        return tokens.transpose(1, 2).reshape(b, c, *shape)
+
     def forward(self, x):
-        x = self.conv1(x)
-        x = self.bn1(x)
-        x = self.relu(x)
-        # x = self.maxpool(x)
-
-        out1 = self.layer1(x)
-        B, C = out1.shape[:2]
-        n_tokens = out1.shape[2:].numel()
-        img_dims = out1.shape[2:]
-        out1_feature_flat = out1.view(B, C, n_tokens).transpose(-1, -2)
-        out1_feature_flat = self.ln(out1_feature_flat)
-        out1 = self.mamba(out1_feature_flat)
-        out1 = out1.transpose(-1, -2).view(B, C, *img_dims)
-        
-        out2 = self.layer2(out1)
-        B, C = out2.shape[:2]
-        n_tokens = out2.shape[2:].numel()
-        img_dims = out2.shape[2:]
-        out2_feature_flat = out2.view(B, C, n_tokens).transpose(-1, -2)
-        out2_feature_flat = self.ln(out2_feature_flat)
-        out2 = self.mamba(out2_feature_flat)
-        out2 = out2.transpose(-1, -2).view(B, C, *img_dims)
-        
-        out3 = self.layer3(out2)
-        B, C = out3.shape[:2]
-        n_tokens = out3.shape[2:].numel()
-        img_dims = out3.shape[2:]
-        out3_feature_flat = out3.view(B, C, n_tokens).transpose(-1, -2)
-        out3_feature_flat = self.ln(out3_feature_flat)
-        out3 = self.mamba(out3_feature_flat)
-        out3 = out3.transpose(-1, -2).view(B, C, *img_dims)
-        
-        out4 = self.layer4(out3)
-        B, C = out4.shape[:2]
-        n_tokens = out4.shape[2:].numel()
-        img_dims = out4.shape[2:]
-        out4_feature_flat = out4.view(B, C, n_tokens).transpose(-1, -2)
-        out4_feature_flat = self.ln(out4_feature_flat)
-        out4 = self.mamba(out4_feature_flat)
-        out4 = out4.transpose(-1, -2).view(B, C, *img_dims)
-
-        # x = self.avgpool(x)
-
-        # x = x.view(x.size(0), -1)
-        # x = self.fc(x)
-
+        x = self.relu(self.bn1(self.conv1(x)))
+        out1 = self._context(self.layer1(x), 1)
+        out2 = self._context(self.layer2(out1), 2)
+        out3 = self._context(self.layer3(out2), 3)
+        out4 = self._context(self.layer4(out3), 4)
         return x, out1, out2, out3, out4
 
 

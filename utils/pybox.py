@@ -1,6 +1,20 @@
 import torch
 import numpy as np
-from box import cpu_nms, cpu_overlap
+try:
+    from box import cpu_nms, cpu_overlap
+    BOX_BACKEND = 'compiled box'
+except ImportError:
+    from utils.box_ops_numpy import nms_indices_numpy, overlap_numpy
+    BOX_BACKEND = 'NumPy CPU fallback'
+
+    def cpu_nms(keep, num_out, dets, order, areas, threshold):
+        indices = nms_indices_numpy(dets.detach().numpy(), threshold, order.numpy())
+        keep[:len(indices)].copy_(torch.from_numpy(indices))
+        num_out[0] = len(indices)
+
+    def cpu_overlap(boxes1, boxes2, overlap):
+        overlap.copy_(torch.from_numpy(overlap_numpy(
+            boxes1.detach().numpy(), boxes2.detach().numpy())))
 
 
 def torch_nms(dets, thresh):
