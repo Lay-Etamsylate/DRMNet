@@ -87,27 +87,32 @@ class MultiDirectionMamba3d(nn.Module):
         return x + self.scale.to(x.dtype) * residual
 
 
-def adaptive_filter3d(x, weights, kernel_size):
+def adaptive_filter3d(x, weights, kernel_size, scale_factor=1):
     """Per-voxel, channel-shared filter without a B*C*K^3*D*H*W unfold.
 
     Replicate padding preserves constants, including at volume boundaries.
-    The caller supplies normalized nonnegative weights, shaped B,K^3,D,H,W.
+    Each output voxel weights the K³ neighbours of its input-grid parent.
+    A scale of two gives the eight children independent weights.
     Shifted views share storage; avoid materializing every channel/neighbour.
     """
     if kernel_size < 1 or kernel_size % 2 != 1:
         raise ValueError("kernel_size must be a positive odd integer")
-    expected = (x.shape[0], kernel_size ** 3, *x.shape[2:])
+    if scale_factor not in (1, 2):
+        raise ValueError("scale_factor must be one or two")
+    expected = (x.shape[0], kernel_size ** 3, *(n * scale_factor for n in x.shape[2:]))
     if x.ndim != 5 or tuple(weights.shape) != expected:
         raise ValueError("filter weights must have shape B,K^3,D,H,W")
     radius = kernel_size // 2
     padded = F.pad(x, (radius,) * 6, mode='replicate')
     d, h, w = x.shape[2:]
+    s = scale_factor
+    blocks = weights.reshape(x.shape[0], kernel_size ** 3, d, s, h, s, w, s)
     result = None
     for i, (z, y, xx) in enumerate(product(range(kernel_size), repeat=3)):
         shifted = padded[:, :, z:z + d, y:y + h, xx:xx + w]
-        contribution = shifted * weights[:, i:i + 1].to(x.dtype)
+        contribution = shifted[:, :, :, None, :, None, :, None] * blocks[:, i:i + 1].to(x.dtype)
         result = contribution if result is None else result + contribution
-    return result
+    return result.reshape(x.shape[0], x.shape[1], d * s, h * s, w * s)
 
 
 class FreqFusion3d(nn.Module):
@@ -119,12 +124,13 @@ class FreqFusion3d(nn.Module):
     """
 
     def __init__(self, hr_channels=64, lr_channels=64, compressed_channels=16,
-                 kernel_size=3, use_checkpoint=True):
+                 kernel_size=3, use_checkpoint=True, reassemble_2x=False):
         super().__init__()
         if kernel_size < 1 or kernel_size % 2 != 1:
             raise ValueError("kernel_size must be a positive odd integer")
         self.kernel_size = kernel_size
         self.use_checkpoint = use_checkpoint
+        self.reassemble_2x = reassemble_2x
         self.hr_compress = nn.Conv3d(hr_channels, compressed_channels, 1)
         self.lr_compress = nn.Conv3d(lr_channels, compressed_channels, 1)
         self.lowpass_logits = nn.Conv3d(compressed_channels, kernel_size ** 3, 3, padding=1)
@@ -146,6 +152,7 @@ class FreqFusion3d(nn.Module):
         return weights / weights.sum(dim=1, keepdim=True).clamp_min(1e-8)
 
     def _forward(self, hr_feat, lr_feat):
+        native_lr = lr_feat
         if lr_feat.shape[2:] != hr_feat.shape[2:]:
             lr_feat = F.interpolate(lr_feat, size=hr_feat.shape[2:],
                                     mode='trilinear', align_corners=False)
@@ -153,7 +160,10 @@ class FreqFusion3d(nn.Module):
         lowpass = self._weights(self.lowpass_logits(context))
         highpass = self._weights(self.highpass_logits(context))
         low_gate, high_gate = self.gates(context).sigmoid().chunk(2, dim=1)
-        smooth_lr = adaptive_filter3d(lr_feat, lowpass, self.kernel_size)
+        if self.reassemble_2x:
+            smooth_lr = adaptive_filter3d(native_lr, lowpass, self.kernel_size, scale_factor=2)
+        else:
+            smooth_lr = adaptive_filter3d(lr_feat, lowpass, self.kernel_size)
         smooth_hr = adaptive_filter3d(hr_feat, highpass, self.kernel_size)
         lr_refined = lr_feat + low_gate * (smooth_lr - lr_feat)
         hr_refined = hr_feat + high_gate * (hr_feat - smooth_hr)

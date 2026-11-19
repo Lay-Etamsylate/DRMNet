@@ -83,6 +83,42 @@ def test_frequency_fusion_preserves_constants_and_handles_odd_sizes():
     torch.testing.assert_close(low, torch.full((2, 5, 5, 7, 9), -3.0))
 
 
+def test_2x_reassembly_matches_independent_child_weights_and_gradients():
+    x = torch.randn(2, 3, 2, 1, 3, dtype=torch.double, requires_grad=True)
+    weights = torch.randn(2, 27, 4, 2, 6, dtype=torch.double).softmax(1).requires_grad_()
+    padded = F.pad(x, (1,) * 6, mode='replicate')
+    expected = torch.zeros(2, 3, 4, 2, 6, dtype=x.dtype)
+    for index, (z, y, xx) in enumerate(product(range(3), repeat=3)):
+        shifted = padded[:, :, z:z+2, y:y+1, xx:xx+3]
+        expected += F.interpolate(shifted, scale_factor=2, mode='nearest') * weights[:, index:index+1]
+    actual = adaptive_filter3d(x, weights, 3, scale_factor=2)
+    torch.testing.assert_close(actual, expected)
+    assert torch.autograd.gradcheck(lambda a, b: adaptive_filter3d(a, b, 3, scale_factor=2),
+                                    (x, weights), fast_mode=True)
+
+
+def test_cross_scale_variant_fuses_native_pyramid_levels_and_restores_checkpoint():
+    cfg = build_model_config(BASE, 'fusion_cross_scale')
+    torch.manual_seed(12)
+    reference = FeatureNet(build_model_config(BASE, 'fusion'), mamba_factory=CausalTestMixer)
+    reference_state = reference.state_dict()
+    torch.manual_seed(12)
+    model = FeatureNet(cfg, mamba_factory=CausalTestMixer).eval()
+    for key, value in model.state_dict().items():
+        torch.testing.assert_close(value, reference_state[key], rtol=0, atol=0)
+    levels = []
+    def record_levels(module, inputs):
+        levels.append([tuple(x.shape[2:]) for x in inputs])
+    model.freqfusion['2'].register_forward_pre_hook(record_levels)
+    x = torch.randn(1, 1, 16, 32, 48)
+    features, _ = model(x)
+    assert levels == [[(4, 8, 12), (2, 4, 6)]]
+    restored = FeatureNet(checkpoint_model_config(BASE, {'model_config': cfg}),
+                          mamba_factory=CausalTestMixer).eval()
+    restored.load_state_dict(model.state_dict(), strict=True)
+    torch.testing.assert_close(restored(x)[0][-1], features[-1])
+
+
 def test_frequency_branches_smooth_and_enhance_an_impulse():
     module = FreqFusion3d(1, 1, compressed_channels=2, use_checkpoint=False)
     for generator in (module.lowpass_logits, module.highpass_logits):

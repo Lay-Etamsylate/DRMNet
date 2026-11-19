@@ -49,10 +49,15 @@ class FeatureNet(nn.Module):
             nn.ReLU(inplace=True))
 
         # upsampling
+        self.reassemble_2x = config.get('freqfusion_reassemble_2x', False)
         self.path2 = nn.Sequential(
             nn.ConvTranspose3d(64, 64, kernel_size=2, stride=2),
             nn.BatchNorm3d(64),
             nn.ReLU(inplace=True))
+        if self.reassemble_2x:
+            # Consume the same initialization draws as fusion, so a matched
+            # seed also matches the initial weights of every shared layer.
+            self.path2 = None
 
         self.reduce3 = nn.Sequential(
             nn.Conv3d(64, 64, kernel_size=1, stride=1),
@@ -92,6 +97,7 @@ class FeatureNet(nn.Module):
                 hr_channels=64, lr_channels=64,
                 compressed_channels=config.get('freqfusion_compressed_channels', 16),
                 kernel_size=config.get('freqfusion_kernel_size', 3),
+                reassemble_2x=self.reassemble_2x and stage == 2,
                 use_checkpoint=config.get('fusion_checkpoint', True))
             for stage in stages
         })
@@ -113,18 +119,16 @@ class FeatureNet(nn.Module):
             out3, rev3 = self.freqfusion['3'](out3, rev3)
         comb3 = self.back3(torch.cat((rev3, out3), 1))
         
-        rev2 = self.path2(comb3)
-        B, C = rev2.shape[:2]
-        n_tokens = rev2.shape[2:].numel()
-        img_dims = rev2.shape[2:]
-        rev2_feature_flat = rev2.view(B, C, n_tokens).transpose(-1, -2)
-        rev2_feature_flat = self.ln1(rev2_feature_flat)
-        rev2 = self.mamba1(rev2_feature_flat)
-        rev2 = rev2.transpose(-1, -2).view(B, C, *img_dims)
-        
         out2 = self.reduce3(out2)
-        if '2' in self.freqfusion:
-            out2, rev2 = self.freqfusion['2'](out2, rev2)
+        if self.reassemble_2x:
+            out2, rev2 = self.freqfusion['2'](out2, comb3)
+        else:
+            rev2 = self.path2(comb3)
+            shape = rev2.shape
+            tokens = self.ln1(rev2.flatten(2).transpose(1, 2))
+            rev2 = self.mamba1(tokens).transpose(1, 2).reshape(shape)
+            if '2' in self.freqfusion:
+                out2, rev2 = self.freqfusion['2'](out2, rev2)
         comb2 = self.back2(torch.cat((rev2, out2), 1))
        
         return [x1, out1, comb2], out1

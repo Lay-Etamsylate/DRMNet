@@ -12,6 +12,11 @@ experimental adaptations, not reproductions of the upstream networks. No LUNA16
 recall improvement has yet been measured. See [the fusion guide](docs/fusion.md)
 for design differences, sources, L20 smoke checks, training and evaluation commands.
 
+The `fusion_cross_scale` variant reconstructs stride-four features from the
+native stride-eight grid. A separate RPN option assigns anchors per nodule.
+The [LUNA16 validation experiment](docs/luna16_ablation.md#跨尺度融合实验) includes
+matched controls and commands for comparing all three projects on subset1.
+
 ## Contributions
 
 We propose the FASS module to incorporate global features by leveraging the spatial relationship between pulmonary nodules and vascular structures to integrate global features. 

@@ -3,7 +3,8 @@
 from copy import deepcopy
 
 
-VARIANTS = ('baseline', 'mamba', 'freqfusion', 'fusion')
+ABLATION_VARIANTS = ('baseline', 'mamba', 'freqfusion', 'fusion')
+VARIANTS = (*ABLATION_VARIANTS, 'fusion_cross_scale')
 
 
 def build_model_config(base, variant='baseline'):
@@ -11,8 +12,9 @@ def build_model_config(base, variant='baseline'):
         raise ValueError('Unknown model variant: %s' % variant)
     cfg = deepcopy(base)
     cfg['model_variant'] = variant
-    cfg['multidirection_stages'] = [3, 4] if variant in ('mamba', 'fusion') else []
-    cfg['freqfusion_stages'] = [2] if variant in ('freqfusion', 'fusion') else []
+    cfg['multidirection_stages'] = [3, 4] if variant in ('mamba', 'fusion', 'fusion_cross_scale') else []
+    cfg['freqfusion_stages'] = [2] if variant in ('freqfusion', 'fusion', 'fusion_cross_scale') else []
+    cfg['freqfusion_reassemble_2x'] = variant == 'fusion_cross_scale'
     cfg.setdefault('fusion_checkpoint', True)
     cfg.setdefault('freqfusion_compressed_channels', 16)
     cfg.setdefault('freqfusion_kernel_size', 3)

@@ -5,8 +5,31 @@ except ImportError:
     from utils.util import py_nms as torch_nms
     from utils.util import py_box_overlap as torch_overlap
 import random
+from scipy.optimize import linear_sum_assignment
 from net.layer.rpn_nms import rpn_encode
-from torch.autograd import Variable
+
+
+def assign_per_nodule(overlap, truth_label, threshold, limit):
+    """Reserve distinct overlapping anchors first, then fill each nodule's quota."""
+    remaining = np.ones(len(overlap), dtype=bool)
+    owners = overlap.argmax(axis=1)
+    valid = np.flatnonzero(truth_label > 0)
+    candidates = np.flatnonzero((overlap[:, valid] > 0).any(axis=1))
+    if candidates.size:
+        iou = overlap[np.ix_(candidates, valid)].T
+        # One extra covered nodule outweighs every possible gain in total IoU.
+        scores = np.where(iou > 0, len(valid) + iou, 0.)
+        gt_row, anchor_col = linear_sum_assignment(scores, maximize=True)
+        matched = iou[gt_row, anchor_col] > 0
+        reserved = candidates[anchor_col[matched]]
+        owners[reserved] = valid[gt_row[matched]]
+        remaining[reserved] = False
+
+    for gt in valid:
+        candidates = np.flatnonzero(remaining & (owners == gt) & (overlap[:, gt] >= threshold))
+        ranked = np.argsort(-overlap[candidates, gt], kind='stable')
+        remaining[candidates[ranked[:limit - 1]]] = False
+    return np.flatnonzero(~remaining), owners
 
 
 def make_one_rpn_target(cfg, mode, input, window, truth_box, truth_label):
@@ -41,56 +64,24 @@ def make_one_rpn_target(cfg, mode, input, window, truth_box, truth_label):
     num_truth_box = len(truth_box)
     if num_truth_box:
 
-        _, depth, height, width = input.size()
-
-        # Get sure background anchor boxes
-        overlap = torch_overlap(window, truth_box)
-
-        # For each anchor box, get the index of the ground truth box that
-        # has the largest IoU with it
-        argmax_overlap = np.argmax(overlap, 1)
-
-        # For each anchor box, get the IoU of the ground truth box that
-        # has the largest IoU with it
-        max_overlap = overlap[np.arange(num_window), argmax_overlap]
-
-        # The anchor box is a sure background, if its largest IoU is less than
-        # a threshold
-        bg_index = np.where(max_overlap < cfg['rpn_train_bg_thresh_high'])[0]
-        label[bg_index] = 0
-        label_weight[bg_index] = 1
-
-        # The anchor box is a sure foreground, if its largest IoU is larger or 
-        # equal than a threshold
-        fg_index = np.where(max_overlap >= cfg['rpn_train_fg_thresh_low'])[0]
+        overlap = np.asarray(torch_overlap(window, truth_box))
+        label_assign[:] = overlap.argmax(axis=1)
+        best_iou = overlap[np.arange(num_window), label_assign]
+        label_weight[best_iou < cfg['rpn_train_bg_thresh_high']] = 1
+        threshold = cfg['rpn_train_fg_thresh_low']
+        limit = cfg.get('rpn_positives_per_nodule', 0)
+        if limit:
+            fg_index, owners = assign_per_nodule(overlap, truth_label, threshold, limit)
+            label_assign[fg_index] = owners[fg_index]
+        else:
+            # Historical experiments sample one positive across the whole patch.
+            tied, gt = np.where(overlap == overlap.max(axis=0))
+            label_assign[tied] = gt
+            candidates = np.union1d(np.flatnonzero(best_iou >= threshold), tied)
+            label_weight[candidates] = 0
+            fg_index = candidates[random.sample(range(len(candidates)), 1)]
         label[fg_index] = 1
         label_weight[fg_index] = 1
-        label_assign[...] = argmax_overlap
-
-        # In case no anchor box that overlaps with the ground truth box meets the threshold, 
-        # for each ground truth box, we include anchor box that has the highest IoU with it, 
-        # include multiple maxs if there exists more than one anchor box
-        argmax_overlap = np.argmax(overlap,0)
-        max_overlap = overlap[argmax_overlap,np.arange(num_truth_box)]
-        argmax_overlap, a = np.where(overlap == max_overlap)
-
-        fg_index = argmax_overlap
-
-        label[fg_index] = 1
-        label_weight[fg_index] = 1
-        label_assign[fg_index] = a
-
-        # In case one ground truth box within one batch has way too many positive anchors, 
-        # which may affect the sample in the loss fucntion,
-        # we only random one positive anchor for each ground truth box
-        fg_index = np.where(label != 0)[0]
-        idx = random.sample(range(len(fg_index)), 1)
-        label[fg_index] = 0
-        label_weight[fg_index] = 0
-        fg_index = fg_index[idx]
-        label[fg_index] = 1
-        label_weight[fg_index] = 1
-
 
         # Prepare regression terms for each positive anchor
         fg_index = np.where(label != 0)[0]
@@ -120,7 +111,8 @@ def make_one_rpn_target(cfg, mode, input, window, truth_box, truth_label):
             # Calculate weight for class balance
             num_fg = max(1, len(fg_index))
             num_bg = len(bg_index)
-            label_weight[bg_index] = float(num_fg)/num_bg
+            if num_bg:
+                label_weight[bg_index] = float(num_fg)/num_bg
 
         target_weight[fg_index] = label_weight[fg_index]
     else:
@@ -133,15 +125,12 @@ def make_one_rpn_target(cfg, mode, input, window, truth_box, truth_label):
             label_weight[bg_index] = 0
             idx = random.sample(range(len(bg_index)), min(num_neg, len(bg_index)))
             bg_index = bg_index[idx]
-            label_weight[bg_index] = 1.0 / len(bg_index)
+            if len(bg_index):
+                label_weight[bg_index] = 1.0 / len(bg_index)
 
 
-    label = Variable(torch.from_numpy(label)).cuda()
-    label_assign = Variable(torch.from_numpy(label_assign)).cuda()
-    label_weight = Variable(torch.from_numpy(label_weight)).cuda()
-    target = Variable(torch.from_numpy(target)).cuda()
-    target_weight = Variable(torch.from_numpy(target_weight)).cuda()
-    return  label, label_assign, label_weight, target, target_weight
+    return tuple(torch.as_tensor(value, device=input.device)
+                 for value in (label, label_assign, label_weight, target, target_weight))
 
 
 def make_rpn_target(cfg, mode, inputs, window, truth_boxes, truth_labels):

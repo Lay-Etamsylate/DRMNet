@@ -66,7 +66,9 @@ class OverfitProbeTests(unittest.TestCase):
                     self.assertEqual(result['positive_feature_zero_fraction'], 1.)
                     self.assertEqual(result['positive_logit_grad_before_relu_l2'], 0.)
                     self.assertEqual(result['same_kind_hard_negative_near_identical_count'], 2)
-                    self.assertAlmostEqual(result['positive_probability'], result['zero_input_probability'])
+                    # Pointwise convolutions on different grid sizes can round differently in FP32.
+                    self.assertAlmostEqual(result['positive_probability'], result['zero_input_probability'],
+                                           delta=torch.finfo(torch.float32).eps)
                 else:
                     self.assertGreater(result['positive_logit_grad_before_relu_l2'], 0.)
                     self.assertEqual(result['same_kind_hard_negative_near_identical_count'], 0)

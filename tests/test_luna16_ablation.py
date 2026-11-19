@@ -7,7 +7,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from scripts.run_luna16_ablation import VARIANTS, main, world_dir, write_summary
+from scripts.run_luna16_ablation import ABLATION_VARIANTS, check_cohort, main, world_dir, write_summary
 from scripts.evaluate_luna16 import KINDS
 from utils.luna_eval import FROC_POINTS
 
@@ -22,7 +22,7 @@ def test_dry_run_pairs_four_fresh_runs_with_their_own_checkpoints(tmp_path, caps
     commands = [shlex.split(line)[2:] for line in capsys.readouterr().out.splitlines()]
     assert len(commands) == 16
     assert not out_dir.exists()
-    for i, variant in enumerate(VARIANTS):
+    for i, variant in enumerate(ABLATION_VARIANTS):
         fresh, joint = commands[2 * i:2 * i + 2]
         inference, evaluation = commands[8 + 2 * i:10 + 2 * i]
 
@@ -43,7 +43,7 @@ def test_dry_run_pairs_four_fresh_runs_with_their_own_checkpoints(tmp_path, caps
 
 def test_summary_uses_raw_froc_points_and_checks_shared_cohort(tmp_path):
     args = SimpleNamespace(out_dir=tmp_path, epochs=80, matching_rule='strict')
-    for variant in VARIANTS:
+    for variant in ABLATION_VARIANTS:
         target = world_dir(args, variant)
         target.mkdir(parents=True)
         for name in ('seriesuids.csv', 'annotations.csv', 'annotations_excluded.csv'):
@@ -63,6 +63,37 @@ def test_summary_uses_raw_froc_points_and_checks_shared_cohort(tmp_path):
     (world_dir(args, 'fusion') / 'seriesuids.csv').write_text('another cohort\n')
     with pytest.raises(ValueError, match='evaluation inputs differ'):
         write_summary(args)
+
+
+def test_validation_of_new_variant_uses_only_subset1_predictions_and_truth(tmp_path, capsys, monkeypatch):
+    common = ['--luna-root', str(tmp_path), '--out-dir', str(tmp_path / 'exp'),
+              '--variant', 'fusion_cross_scale', '--dry-run']
+    monkeypatch.setattr(sys, 'argv', ['runner', 'train-val', *common, '--rpn-positives-per-nodule', '3'])
+    main()
+    commands = capsys.readouterr().out.splitlines()
+    assert len(commands) == 4
+    assert all('--rpn-positives-per-nodule 3' in line for line in commands[:2])
+    assert all('val.npy' in line and 'test.npy' not in line for line in commands)
+    monkeypatch.setattr(sys, 'argv', ['runner', 'val', *common, '--epochs', '40'])
+    main()
+    validation = capsys.readouterr().out.splitlines()
+    assert len(validation) == 2
+    assert 'fusion_cross_scale/model/040.ckpt' in validation[0]
+    assert all('val.npy' in cmd and 'val_annos.csv' in cmd and 'val_predictions' in cmd
+               and 'test.npy' not in cmd for cmd in validation)
+
+
+def test_cohort_rejects_interchanged_subsets_even_with_correct_size(tmp_path):
+    directory = tmp_path / 'subset1'
+    directory.mkdir()
+    ids = [f'val{i}' for i in range(89)]
+    for uid in ids:
+        (directory / f'{uid}.mhd').touch()
+    check_cohort(tmp_path, 'val', ids)
+    with pytest.raises(ValueError, match='does not match'):
+        check_cohort(tmp_path, 'val', ['test0', *ids[1:]])
+    with pytest.raises(ValueError, match='expected 710'):
+        check_cohort(tmp_path, 'train', ids)
 
 
 def test_seeded_reader_crops_are_independent_of_global_random_state(tmp_path):

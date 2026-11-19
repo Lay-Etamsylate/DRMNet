@@ -58,6 +58,8 @@ parser.add_argument('--stop-after-epoch', type=int, help='stop early without com
 parser.add_argument('--report-head-health', action='store_true', help='log activations/gradients every 200 training batches')
 parser.add_argument('--rpn-train-pre-topk', type=int, default=None, help='train/valid candidates before NMS; zero means unlimited')
 parser.add_argument('--rpn-train-post-topk', type=int, default=None, help='train/valid candidates after NMS; zero means unlimited')
+parser.add_argument('--rpn-positives-per-nodule', type=int,
+                    help='maximum positive anchors per nodule; 0 restores the historical one per patch')
 parser.add_argument('--optimizer', default=None, type=str, metavar='SPLIT',
                     help='which split set to use')
 parser.add_argument('--init-lr', default=None, type=float,
@@ -104,7 +106,7 @@ def main():
         model_cfg = resolve_model_for_training(net_config, source, args.variant, args.head_activation,
                                                bool(args.ckpt), args.reset_heads)
         model_cfg = configure_training_experiment(model_cfg, args.auxiliary_losses, args.scale_augmentation)
-        for name in ('rpn_train_pre_topk', 'rpn_train_post_topk'):
+        for name in ('rpn_train_pre_topk', 'rpn_train_post_topk', 'rpn_positives_per_nodule'):
             value = getattr(args, name)
             if value is not None:
                 if value < 0:
@@ -320,8 +322,8 @@ def train(net, train_loader, optimizer, epoch, writer, max_grad_norm=0., report_
                 values = probs[(labels_flat == label) & (weights_flat > 0)]
                 health['rpn_' + name + '_mean_probability'] = float(values.mean()) if values.numel() else None
             negatives = probs[(labels_flat == 0) & (weights_flat > 0)]
-            positives_count = int((labels_flat == 1).sum())
-            k = min(negatives.numel(), net.cfg['num_hard'] * positives_count)
+            positives_count = int(((labels_flat == 1) & (weights_flat > 0)).sum())
+            k = min(negatives.numel(), net.cfg['num_hard'] * max(1, positives_count))
             hard = negatives.topk(k).values if net.cfg['num_hard'] > 0 else negatives
             health['rpn_hard_negative_mean_probability'] = float(hard.mean()) if hard.numel() else None
             health['rpn_hard_negative_max_probability'] = float(hard.max()) if hard.numel() else None

@@ -15,11 +15,8 @@ def weighted_focal_loss_for_cross_entropy(logits, labels, weights, gamma=2.):
 
 def binary_cross_entropy_with_hard_negative_mining(logits, labels, weights, batch_size, num_hard=2):
     classify_loss = nn.BCEWithLogitsLoss()
-    # classify_loss = nn.BCELoss()
-    # probs = torch.sigmoid(logits)[:, 0].view(-1, 1)
-    probs = logits[:, 0].view(-1, 1)
     probs = logits[:, 0].float().view(-1, 1)
-    pos_idcs = labels[:, 0] == 1
+    pos_idcs = (labels[:, 0] == 1) & (weights[:, 0] != 0)
 
     pos_prob = probs[pos_idcs, 0]
     pos_labels = labels[pos_idcs, 0]
@@ -33,23 +30,15 @@ def binary_cross_entropy_with_hard_negative_mining(logits, labels, weights, batc
     neg_prob = probs[neg_idcs, 0]
     neg_labels = labels[neg_idcs, 0]
     if num_hard > 0:
-        neg_prob, neg_labels = OHEM(neg_prob, neg_labels, num_hard * len(pos_prob))
+        neg_prob, neg_labels = OHEM(neg_prob, neg_labels, num_hard * max(1, len(pos_prob)))
 
-    pos_correct = 0
-    pos_total = 0
-    if len(pos_prob) > 0:
-        cls_loss = 0.5 * classify_loss(
-            pos_prob, pos_labels.float()) + 0.5 * classify_loss(
-            neg_prob, neg_labels.float())
-        # These are raw logits: sigmoid(logit) >= 0.5 iff logit >= 0.
-        # This affects reporting only; BCEWithLogitsLoss still uses logits.
-        pos_correct = (pos_prob >= 0).sum()
-        pos_total = len(pos_prob)
-    else:
-        cls_loss = 0.5 * classify_loss(
-            neg_prob, neg_labels.float())
-
-
+    cls_loss = probs[:0].sum()
+    if len(pos_prob):
+        cls_loss = cls_loss + 0.5 * classify_loss(pos_prob, pos_labels.float())
+    if len(neg_prob):
+        cls_loss = cls_loss + 0.5 * classify_loss(neg_prob, neg_labels.float())
+    pos_correct = (pos_prob >= 0).sum()
+    pos_total = len(pos_prob)
     neg_correct = (neg_prob < 0).sum()
     neg_total = len(neg_prob)
     return cls_loss, pos_correct, pos_total, neg_correct, neg_total
@@ -131,16 +120,11 @@ def rpn_loss(logits, deltas, labels, label_weights, targets, target_weights, cfg
     deltas = deltas.view(batch_size, 6)
     targets = targets.view(batch_size, 6)
 
-    index = (labels != 0).nonzero()[:,0]
-    deltas  = deltas[index]
-    targets = targets[index]
-
-    rpn_reg_loss = 0
-    reg_losses = []
-    for i in range(6):
-        l = F.smooth_l1_loss(deltas[:, i], targets[:, i])
-        rpn_reg_loss += l
-        reg_losses.append(l.data.item())
+    positive = target_weights.reshape(-1) > 0
+    regression = F.smooth_l1_loss(deltas[positive], targets[positive], reduction='none')
+    per_axis = regression.sum(0) / max(1, len(regression))
+    rpn_reg_loss = per_axis.sum()
+    reg_losses = per_axis.detach().tolist()
 
     return rpn_cls_loss, rpn_reg_loss, [pos_correct.item(), pos_total, neg_correct.item(), neg_total,
                                         reg_losses[0], reg_losses[1], reg_losses[2],
