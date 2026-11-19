@@ -34,6 +34,28 @@ class BoxOpsTests(unittest.TestCase):
         self.assertEqual(overlap_numpy(a, np.empty((0, 6))).shape, (1, 0))
         self.assertEqual(nms_indices_numpy(np.empty((0, 7)), .1).shape, (0,))
 
+    def test_rcnn_class_column_and_row_indices(self):
+        # Seven eight-column rows used to reshape silently into eight rows.
+        dets = np.array([
+            [.7, 0, 0, 0, 2, 2, 2, 1],
+            [.9, 0, 0, 0, 2, 2, 2, 1],
+            [.8, 10, 0, 0, 2, 2, 2, 1],
+            [.6, 10, 0, 0, 2, 2, 2, 1],
+            [.5, 20, 0, 0, 2, 2, 2, 1],
+            [.4, 20, 0, 0, 2, 2, 2, 1],
+            [.3, 30, 0, 0, 2, 2, 2, 1],
+        ], np.float32)
+        np.testing.assert_array_equal(nms_indices_numpy(dets, .1), [1, 2, 4, 6])
+        np.testing.assert_array_equal(nms_indices_numpy(dets[:1], .1), [0])
+        np.testing.assert_array_equal(
+            nms_indices_numpy(dets, .1, order=[0, 1, 2, 3, 4, 5, 6]), [0, 2, 4, 6])
+        self.assertEqual(nms_indices_numpy(np.empty((0, 8)), .1).shape, (0,))
+
+    def test_nms_rejects_invalid_shape(self):
+        for shape in ((14,), (7, 6), (1, 1, 7)):
+            with self.subTest(shape=shape), self.assertRaisesRegex(ValueError, 'shape'):
+                nms_indices_numpy(np.zeros(shape), .1)
+
 
 if __name__ == '__main__':
     unittest.main()

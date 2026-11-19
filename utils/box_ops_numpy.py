@@ -29,7 +29,15 @@ def overlap_numpy(boxes1, boxes2, chunk_size=2048):
 
 
 def nms_indices_numpy(dets, threshold, order=None):
-    dets = np.asarray(dets, dtype=np.float32).reshape(-1, 7)
+    """Suppress using score + six box columns; ignore trailing metadata.
+
+    RPN rows have seven columns, while RCNN appends a class ID. Returned
+    indices always refer to the original rows, as in the legacy C kernel.
+    """
+    dets = np.asarray(dets, dtype=np.float32)
+    if dets.ndim != 2 or dets.shape[1] < 7:
+        raise ValueError('dets must have shape (N, >=7): score,z,y,x,d,h,w[,metadata]')
+    boxes = dets[:, 1:7]
     if order is None:
         order = np.argsort(-dets[:, 0], kind='stable')
     else:
@@ -39,6 +47,6 @@ def nms_indices_numpy(dets, threshold, order=None):
         index = int(order[0])
         keep.append(index)
         rest = order[1:]
-        overlaps = overlap_numpy(dets[index:index + 1, 1:], dets[rest, 1:])[0]
+        overlaps = overlap_numpy(boxes[index:index + 1], boxes[rest])[0]
         order = rest[overlaps < threshold]
     return np.asarray(keep, dtype=np.int64)

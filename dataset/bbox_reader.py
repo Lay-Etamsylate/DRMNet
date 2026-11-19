@@ -7,7 +7,6 @@ import warnings
 from scipy.ndimage.interpolation import rotate
 import math
 import time
-import nrrd
 import pandas as pd
 
 class BboxReader(Dataset):
@@ -21,6 +20,8 @@ class BboxReader(Dataset):
         self.stride = cfg['stride']
         self.blacklist = cfg['blacklist']
         self.set_name = set_name
+        self.crop_seed = cfg.get('crop_seed')
+        self.epoch = 0
 
         sizelim = 0
         sizelim2 = 10
@@ -81,14 +82,18 @@ class BboxReader(Dataset):
 #         import pdb;pdb.set_trace()
 
     def __getitem__(self, idx):
-        t = time.time()
-        np.random.seed(int(str(t % 1)[2:7]))  # seed according to time
+        rng = np.random
+        if self.crop_seed is None:
+            t = time.time()
+            np.random.seed(int(str(t % 1)[2:7]))  # seed according to time
+        elif self.mode in ('train', 'val'):
+            rng = np.random.RandomState([self.crop_seed, self.epoch, idx])
         is_random_img  = False
         if self.mode in ['train', 'val']:
             if idx >= len(self.bboxes):
                 is_random_crop = True
                 idx = idx % len(self.bboxes)
-                is_random_img = np.random.randint(2)
+                is_random_img = rng.randint(2)
             else:
                 is_random_crop = False
         else:
@@ -111,12 +116,14 @@ class BboxReader(Dataset):
 
                 bboxes = self.sample_bboxes[int(bbox[0])]
                 isScale = self.augtype['scale'] and (self.mode=='train')
-                sample, target, bboxes, coord = self.crop(imgs, bbox[1:], bboxes,isScale,is_random_crop)
+                sample, target, bboxes, coord = self.crop(
+                    imgs, bbox[1:], bboxes, isScale, is_random_crop, rng=rng)
                 if self.mode == 'train' and not is_random_crop:
-                     sample, target, bboxes = augment(sample, target, bboxes, do_flip = self.augtype['flip'], 
-                                                             do_rotate=self.augtype['rotate'], do_swap = self.augtype['swap'])
+                    sample, target, bboxes = augment(
+                        sample, target, bboxes, do_flip=self.augtype['flip'],
+                        do_rotate=self.augtype['rotate'], do_swap=self.augtype['swap'], rng=rng)
             else:
-                randimid = np.random.randint(len(self.filenames))
+                randimid = rng.randint(len(self.filenames))
                 filename = self.filenames[randimid]
                 imgs = np.load(os.path.join(self.data_dir, '%s_clean.npy' % (filename)))
 #                 imgs = np.expand_dims(imgs,0)
@@ -130,7 +137,7 @@ class BboxReader(Dataset):
 
                 bboxes = self.sample_bboxes[randimid]
                 isScale = self.augtype['scale'] and (self.mode=='train')
-                sample, target, bboxes, coord = self.crop(imgs, [], bboxes,isScale=False,isRand=True)
+                sample, target, bboxes, coord = self.crop(imgs, [], bboxes, isRand=True, rng=rng)
 
             if sample.shape[1] != self.cfg['crop_size'][0] or sample.shape[2] != \
                 self.cfg['crop_size'][1] or sample.shape[3] != self.cfg['crop_size'][2]:
@@ -234,14 +241,13 @@ def fillter_box(bboxes, size):
             res.append(box)
     return np.array(res)
 
-def augment(sample, target, bboxes, do_flip = True, do_rotate=True, do_swap = True):
-    #  angle1 = np.random.rand()*180
+def augment(sample, target, bboxes, do_flip=True, do_rotate=True, do_swap=True, *, rng=np.random):
     if do_rotate:
         validrot = False
         counter = 0
         while not validrot:
             newtarget = np.copy(target)
-            angle1 = np.random.rand()*180
+            angle1 = rng.rand()*180
             size = np.array(sample.shape[2:4]).astype('float')
             rotmat = np.array([[np.cos(angle1/180*np.pi),-np.sin(angle1/180*np.pi)],[np.sin(angle1/180*np.pi),np.cos(angle1/180*np.pi)]])
             newtarget[1:3] = np.dot(rotmat,target[1:3]-size/2)+size/2
@@ -257,14 +263,13 @@ def augment(sample, target, bboxes, do_flip = True, do_rotate=True, do_swap = Tr
                     break
     if do_swap:
         if sample.shape[1]==sample.shape[2] and sample.shape[1]==sample.shape[3]:
-            axisorder = np.random.permutation(3)
+            axisorder = rng.permutation(3)
             sample = np.transpose(sample,np.concatenate([[0],axisorder+1]))
             target[:3] = target[:3][axisorder]
             bboxes[:,:3] = bboxes[:,:3][:,axisorder]
 
     if do_flip:
-        # flipid = np.array([np.random.randint(2),np.random.randint(2),np.random.randint(2)])*2-1
-        flipid = np.array([1,np.random.randint(2),np.random.randint(2)])*2-1
+        flipid = np.array([1,rng.randint(2),rng.randint(2)])*2-1
         sample = np.ascontiguousarray(sample[:,::flipid[0],::flipid[1],::flipid[2]])
         # for ax in range(3):
         #     if flipid[ax]==-1:
@@ -286,13 +291,13 @@ class Crop(object):
         self.bound_size = config['bound_size']
         self.stride = config['stride']
         self.pad_value = config['pad_value']
-    def __call__(self, imgs, target, bboxes,isScale=False,isRand=False):
+    def __call__(self, imgs, target, bboxes, isScale=False, isRand=False, *, rng=np.random):
         if isScale:
             radiusLim = [8.,120.]
             scaleLim = [0.75,1.25]
             scaleRange = [np.min([np.max([(radiusLim[0]/target[3]),scaleLim[0]]),1])
                          ,np.max([np.min([(radiusLim[1]/target[3]),scaleLim[1]]),1])]
-            scale = np.random.rand()*(scaleRange[1]-scaleRange[0])+scaleRange[0]
+            scale = rng.rand()*(scaleRange[1]-scaleRange[0])+scaleRange[0]
             crop_size = (np.array(self.crop_size).astype('float')/scale).astype('int')
         else:
             crop_size=self.crop_size
@@ -316,9 +321,9 @@ class Crop(object):
                 e = np.min([crop_size[i]/2, imgs.shape[i+1]/2-bound_size])
                 target = np.array([np.nan,np.nan,np.nan,np.nan])
             if s>e:
-                start.append(np.random.randint(e,s))#!
+                start.append(rng.randint(e,s))
             else:
-                start.append(int(target[i])-int(crop_size[i]/2)+np.random.randint(-bound_size/2,bound_size/2))
+                start.append(int(target[i])-int(crop_size[i]/2)+rng.randint(-bound_size/2,bound_size/2))
 
         normstart = np.array(start).astype('float32')/np.array(imgs.shape[1:])-0.5
         normsize = np.array(crop_size).astype('float32')/np.array(imgs.shape[1:])

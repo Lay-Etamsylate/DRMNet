@@ -41,14 +41,16 @@ def binary_cross_entropy_with_hard_negative_mining(logits, labels, weights, batc
         cls_loss = 0.5 * classify_loss(
             pos_prob, pos_labels.float()) + 0.5 * classify_loss(
             neg_prob, neg_labels.float())
-        pos_correct = (pos_prob >= 0.5).sum()
+        # These are raw logits: sigmoid(logit) >= 0.5 iff logit >= 0.
+        # This affects reporting only; BCEWithLogitsLoss still uses logits.
+        pos_correct = (pos_prob >= 0).sum()
         pos_total = len(pos_prob)
     else:
         cls_loss = 0.5 * classify_loss(
             neg_prob, neg_labels.float())
 
 
-    neg_correct = (neg_prob < 0.5).sum()
+    neg_correct = (neg_prob < 0).sum()
     neg_total = len(neg_prob)
     return cls_loss, pos_correct, pos_total, neg_correct, neg_total
 

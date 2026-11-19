@@ -21,6 +21,7 @@ nvcc --version
 g++ --version
 
 python -m pip install pip==24.0 setuptools==69.5.1 wheel==0.43.0
+python -m pip install numpy==1.26.4
 python -m pip install torch==2.1.2 torchvision==0.16.2 \
   --index-url https://download.pytorch.org/whl/cu121
 
@@ -28,8 +29,9 @@ python -m pip install torch==2.1.2 torchvision==0.16.2 \
 export DRMNET_DIR=/data/DRMNet
 cd "$DRMNET_DIR"
 python -m pip install -r "$DRMNET_DIR/requirements-l20.txt"
-python -m pip install causal-conv1d==1.2.0.post2 --no-build-isolation
-python -m pip install mamba-ssm==1.2.2 --no-build-isolation
+# 此时依赖已安装；防止扩展安装再次解析并改动 torch/numpy 等版本。
+python -m pip install causal-conv1d==1.2.0.post2 --no-build-isolation --no-deps
+python -m pip install mamba-ssm==1.2.2 --no-build-isolation --no-deps
 python -m pip check
 ```
 
@@ -54,6 +56,18 @@ CUDA Version 字段判断系统是否有 nvcc。新开终端后先激活 Conda �
 `CUDA_HOME`、`PATH`、`MPLBACKEND` 和项目路径变量。
 
 ## 环境检查
+
+如果出现 `Failed to initialize NumPy: _ARRAY_API not found`，先检查 NumPy
+实际版本；对于此处 PyTorch 2.1.2 环境，重新安装固定的 1.26.4，再验证桥接：
+
+```bash
+python -m pip install --no-cache-dir --force-reinstall numpy==1.26.4
+python -c 'import numpy as np, torch; print(np.__version__, torch.__version__); print(torch.from_numpy(np.zeros(3, dtype=np.float32)).numpy())'
+```
+
+`No module named mamba_ssm` 是另一个问题：该解释器下未安装成功 Mamba，
+仅降级 NumPy 不会安装 Mamba。重新执行上面的扩展安装，确认退出码为零；
+若失败，保留 pip 安装日志末尾的编译/下载错误，勿仅重复运行 import。
 
 ```bash
 python - <<'PY'
@@ -161,27 +175,77 @@ CUDA_VISIBLE_DEVICES=0 python "$DRMNET_DIR/train.py" \
 
 ## 测试 / FROC
 
-确认 FROC 标注与预测处于相同坐标系后执行：
+当前服务器划分已经确认：subset2–9 训练（710 例 / 946 个结节），subset1
+验证（89 例 / 128 个结节），subset0 测试（89 例 / 112 个结节）。扫描 ID 无交叉；
+这是一次固定划分，不是完整十折交叉验证。以下命令使用实际 `drmnet_preprocessed/filelists`。
+
+先进行推理，保存预处理体素坐标的预测和完整推理清单：
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 python "$DRMNET_DIR/test.py" \
-  --mode eval \
+  --mode eval --inference-only \
   --weight "$RUN_DIR/model/080.ckpt" \
-  --test-set-name "$LUNA_ROOT/fold0/test.npy" \
-  --preprocessed-data-dir "$LUNA_ROOT/preprocessed" \
-  --test-anno "$LUNA_ROOT/fold0/test_annos.csv" \
-  --froc-annotations "$LUNA_ROOT/evaluation/annotations.csv" \
-  --froc-excluded "$LUNA_ROOT/evaluation/annotations_excluded.csv" \
-  --froc-seriesuids "$LUNA_ROOT/fold0/test_seriesuids.csv" \
-  --out-dir "$RUN_DIR"
+  --test-set-name "$LUNA_ROOT/drmnet_preprocessed/filelists/test.npy" \
+  --preprocessed-data-dir "$LUNA_ROOT/drmnet_preprocessed" \
+  --test-anno "$LUNA_ROOT/drmnet_preprocessed/filelists/test_annos.csv" \
+  --out-dir "$RUN_DIR/test_predictions"
 ```
 
 架构从检查点自动恢复。`080.ckpt` 只是命令示例，正式报告应使用验证集选择的轮次。
-评估子目录为 `$RUN_DIR/res/80/FROC/`（其他轮次对应其他数字）。
-原汇总 CSV 代码使用字符串拼接输出在 `${RUN_DIR}froc_include_fp.csv` 和
-`${RUN_DIR}froc_simple.csv`，即与 RUN_DIR 同级、带运行目录名前缀的文件。
-重点比较 RPN/RCNN/ensemble 的七点 CPM，以及 1、2、4 FP/scan 时的召回率。
+若已有完整预测，无需重跑网络。接下来在 CPU 上转换并评估：
+
+```bash
+python "$DRMNET_DIR/scripts/evaluate_luna16.py" \
+  --pred-dir "$RUN_DIR/test_predictions/res/80/FROC" \
+  --meta-dir "$LUNA_ROOT/drmnet_preprocessed" \
+  --test-set "$LUNA_ROOT/drmnet_preprocessed/filelists/test.npy" \
+  --annotations "$LUNA_ROOT/annotations.csv" \
+  --out-dir "$RUN_DIR/test_predictions/res/80/FROC_world"
+```
+
+程序自动在 `$LUNA_ROOT/evaluationScript` 下寻找唯一的非空 `annotations_excluded.csv`；
+也可用 `--excluded /实际路径/annotations_excluded.csv` 指定。仓库自带的同名文件只有表头，
+不能代替 [LUNA16 官方排除标注](https://luna16.grand-challenge.org/Data/)。
+
+新推理会生成 `FROC/inference_manifest.json`，记录全部测试扫描（包括零检出）和各自的预测数量。
+旧推理没有清单时，只有确认日志中全部测试扫描均已完成，才可增加 `--assume-complete`。
+本次用户已确认同步到本地的三份 CSV 来自完整测试，因此这批旧结果可用该参数。
+不能只用 CSV 中出现的扫描作为评估集合：本次三份 CSV 各有 156 条预测、14 个扫描 ID，
+仍须以全部 89 个扫描、112 个参考结节评估。
+
+转换公式为 `world_xyz = origin_xyz + direction @ ((cropped_xyz + crop_start_zyx[::-1]) * spacing_xyz)`，
+使用 **resampled** 元数据，不再乘 source spacing。程序会逐一核对测试标注中心的世界坐标、
+官方标注数量与位置，防止重复变换或漏标；原始预测 CSV 保留不变。
+
+输出 `FROC_world/metrics.txt`、`summary.json` 以及 rpn/rcnn/ensemble 子目录中的曲线和统计。
+七点召回率按固定 FP/scan 位置插值（替代旧版向上取点），CPM 为七点均值。
+曲线最高 FP/scan 小于目标点时，按末端灵敏度延伸；不会编造额外检出。
+bootstrap 以扫描为单位重采样 1000 次，默认随机种子 35202；零检出曲线也输出完整七点。
+重点比较原始曲线的 CPM，以及 1、2、4 FP/scan 时的召回率，并分别报告 bootstrap 结果。
 test.py 按整例预处理 CT 推理；大体积显存占用需实际验证，当前没有滑窗推理入口。
+
+## subset0 混淆矩阵
+
+病例级矩阵使用完整测试清单。官方标注中含至少一个结节的病例为实际阳性；
+所选预测头输出至少一个分数 ≥ 阈值的候选时，该病例为预测阳性。
+同一病例只计一次，零检出病例也参加统计。矩阵行是真实标签，列是预测标签，
+顺序均为阴性、阳性，即 `[[TN, FP], [FN, TP]]`。
+
+```bash
+python "$DRMNET_DIR/scripts/confusion_matrix_luna16.py" \
+  --pred-dir "$RUN_DIR/test_predictions/res/80/FROC" \
+  --test-set "$LUNA_ROOT/drmnet_preprocessed/filelists/test.npy" \
+  --annotations "$LUNA_ROOT/annotations.csv" \
+  --head ensemble --threshold 0.5 \
+  --out "$RUN_DIR/subset0_scan_confusion.json"
+```
+
+评估文档中确认过的本地旧预测使用 `--pred-dir "$DRMNET_DIR/FROC" --assume-complete`。
+病例级矩阵只判断该扫描是否有候选，候选的位置可能与标注结节不同。
+需要评价定位时，在上面的 `scripts/evaluate_luna16.py` 命令中增加
+`--matching-rule strict --confusion-threshold 0.5`，并使用新的 `--out-dir`。
+各预测头的子目录会生成 `confusion_matrix.json`，其中 TP、FP 和 FN 沿用该次 FROC
+的匹配与排除规则。结节检测没有定义背景负样本总数，所以 TN 记为 `null`。
 
 ## 版本依据
 

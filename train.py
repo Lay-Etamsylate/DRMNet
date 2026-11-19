@@ -16,6 +16,11 @@ import sys
 from tqdm import tqdm
 import random
 import traceback
+import json
+from pathlib import Path
+from net.training_setup import (TRAINING_FIELDS, resolve_training_settings,
+    resolve_model_for_training, load_training_weights, install_health_hooks,
+    configure_training_experiment)
 from torch.utils.tensorboard import SummaryWriter
 import shutil
 import pandas as pd
@@ -31,21 +36,35 @@ parser.add_argument('--net', '-m', metavar='NET', default=train_config['net'],
                     help='neural net')
 parser.add_argument('--variant', choices=VARIANTS, default=None,
                     help='architecture ablation; default baseline, or restore from --ckpt')
-parser.add_argument('--epochs', default=train_config['epochs'], type=int, metavar='N',
+parser.add_argument('--epochs', default=None, type=int, metavar='N',
                     help='number of total epochs to run')
 parser.add_argument('--batch-size', default=train_config['batch_size'], type=int, metavar='N',
                     help='batch size')
-parser.add_argument('--epoch-rcnn', default=train_config['epoch_rcnn'], type=int, metavar='NR',
+parser.add_argument('--epoch-rcnn', default=None, type=int, metavar='NR',
                     help='number of epochs before training rcnn')
-parser.add_argument('--ckpt', default=train_config['initial_checkpoint'], type=str, metavar='CKPT',
-                    help='checkpoint to use')
-parser.add_argument('--optimizer', default=train_config['optimizer'], type=str, metavar='SPLIT',
+checkpoint_group = parser.add_mutually_exclusive_group()
+checkpoint_group.add_argument('--ckpt', default=train_config['initial_checkpoint'], type=str, metavar='CKPT',
+                    help='resume model, optimizer and epoch')
+checkpoint_group.add_argument('--init-from', type=str,
+                    help='load weights only; start epoch 1 with a new optimizer')
+parser.add_argument('--reset-heads', action='store_true', help='with --init-from, reinitialize RPN and RCNN heads')
+parser.add_argument('--head-activation', choices=('relu', 'leaky_relu'), default=None)
+parser.add_argument('--auxiliary-losses', choices=('on', 'off'), default=None,
+                    help='off bypasses KL/low-rank branches; saved in model_config')
+parser.add_argument('--scale-augmentation', choices=('on', 'off'), default=None,
+                    help='control crop scale augmentation; saved in model_config')
+parser.add_argument('--max-grad-norm', type=float, default=None, help='gradient clipping; zero disables it')
+parser.add_argument('--stop-after-epoch', type=int, help='stop early without compressing the --epochs LR schedule')
+parser.add_argument('--report-head-health', action='store_true', help='log activations/gradients every 200 training batches')
+parser.add_argument('--rpn-train-pre-topk', type=int, default=None, help='train/valid candidates before NMS; zero means unlimited')
+parser.add_argument('--rpn-train-post-topk', type=int, default=None, help='train/valid candidates after NMS; zero means unlimited')
+parser.add_argument('--optimizer', default=None, type=str, metavar='SPLIT',
                     help='which split set to use')
-parser.add_argument('--init-lr', default=train_config['init_lr'], type=float,
+parser.add_argument('--init-lr', default=None, type=float,
                     metavar='LR', help='initial learning rate')
-parser.add_argument('--momentum', default=train_config['momentum'], type=float, metavar='M',
+parser.add_argument('--momentum', default=None, type=float, metavar='M',
                     help='momentum')
-parser.add_argument('--weight-decay', default=train_config['weight_decay'], type=float,
+parser.add_argument('--weight-decay', default=None, type=float,
                     metavar='W', help='weight decay (default: 1e-4)')
 parser.add_argument('--epoch-save', default=train_config['epoch_save'], type=int, metavar='S',
                     help='save frequency')
@@ -69,16 +88,50 @@ parser.add_argument('--val-data-dir', default=train_config['val_dir'],  nargs='+
                     help='path to load data')
 parser.add_argument('--num-workers', default=train_config['num_workers'], type=int, metavar='N',
                     help='number of data loading workers')
+parser.add_argument('--seed', type=int, help='seed initialization, per-epoch data order and crop augmentation')
 
 
 def main():
     # Load training configuration
     args = parser.parse_args()
-    resume = torch.load(args.ckpt, map_location='cpu') if args.ckpt else None
-    model_cfg = (checkpoint_model_config(net_config, resume, args.variant)
-                 if resume is not None else build_model_config(net_config, args.variant or 'baseline'))
+    source_path = args.ckpt or args.init_from
+    source = torch.load(source_path, map_location='cpu') if source_path else None
+    try:
+        training_settings = resolve_training_settings(train_config, source if args.ckpt else None,
+            **{key: getattr(args, key) for key in TRAINING_FIELDS})
+        for key, value in training_settings.items():
+            setattr(args, key, value)
+        model_cfg = resolve_model_for_training(net_config, source, args.variant, args.head_activation,
+                                               bool(args.ckpt), args.reset_heads)
+        model_cfg = configure_training_experiment(model_cfg, args.auxiliary_losses, args.scale_augmentation)
+        for name in ('rpn_train_pre_topk', 'rpn_train_post_topk'):
+            value = getattr(args, name)
+            if value is not None:
+                if value < 0:
+                    raise ValueError(name + ' must be nonnegative')
+                model_cfg[name] = value
+    except ValueError as exc:
+        parser.error(str(exc))
+    if args.seed is None and args.ckpt:
+        args.seed = source.get('training_settings', {}).get('seed')
+    if args.seed is not None:
+        if not 0 <= args.seed < 2**32:
+            parser.error('--seed must be in [0, 2**32)')
+        training_settings['seed'] = args.seed
+        random.seed(args.seed)
+        np.random.seed(args.seed)
+        torch.manual_seed(args.seed)
+    start_epoch = int(source['epoch']) + 1 if args.ckpt else 1
+    last_epoch = min(args.epochs, args.stop_after_epoch) if args.stop_after_epoch is not None else args.epochs
+    if last_epoch < start_epoch:
+        parser.error('stop/total epoch must be at least the next training epoch: %d' % start_epoch)
+    if not args.ckpt:
+        model_dir = Path(args.out_dir) / 'model'
+        if (args.init_from and Path(args.out_dir).resolve() == Path(args.init_from).resolve().parent.parent) or any(model_dir.glob('*.ckpt')):
+            parser.error('New training requires an output directory without existing checkpoints; use --ckpt to resume')
     data_cfg = dict(config, **model_cfg)
     data_cfg['batch_size'] = args.batch_size
+    data_cfg['crop_seed'] = args.seed
     if not (len(args.train_set) == len(args.train_data_dir) == len(args.train_anno)):
         parser.error('--train-set, --train-data-dir and --train-anno must have equal lengths')
     if not (len(args.val_set) == len(args.val_data_dir) == len(args.val_anno)):
@@ -121,10 +174,14 @@ def main():
     total_train_dataset = StackDataset(*train_dataset_list)
         
     total_val_dataset = ConcatDataset(val_dataset_list)
+    train_order = torch.Generator() if args.seed is not None else None
+    val_order = torch.Generator().manual_seed(args.seed) if args.seed is not None else None
     train_loader = DataLoader(total_train_dataset, batch_size=batch_size, shuffle=True,
-                              num_workers=args.num_workers, pin_memory=True, collate_fn=train_collate)
+                              num_workers=args.num_workers, pin_memory=True, collate_fn=train_collate,
+                              generator=train_order)
     val_loader = DataLoader(total_val_dataset, batch_size=batch_size, shuffle=False,
-                              num_workers=args.num_workers, pin_memory=True, collate_fn=eval_collate)
+                            num_workers=args.num_workers, pin_memory=True, collate_fn=eval_collate,
+                            generator=val_order)
 
 #     train_dataset = BboxReader(train_data_dir, args.train_set, config, mode='train')
 #     val_dataset = BboxReader(val_data_dir, args.val_set, config, mode='val')
@@ -137,21 +194,18 @@ def main():
     
     # Initilize network
     net = getattr(this_module, net)(model_cfg)
+    if source is not None:
+        load_training_weights(net, source, model_cfg, reset_heads=args.reset_heads)
+        print('[%s from %s; reset_heads=%s]' % ('Resume' if args.ckpt else 'Weights-only initialization',
+                                               source_path, args.reset_heads))
     net = net.cuda()
     
     optimizer = getattr(torch.optim, optimizer)
     optimizer = optimizer(net.parameters(), lr=init_lr, weight_decay=weight_decay, momentum=momentum)
 
-    start_epoch = 0
-
     if initial_checkpoint:
-        print('[Loading model from %s]' % initial_checkpoint)
-        start_epoch = resume['epoch']
-        net.load_state_dict(resume['state_dict'], strict=True)
-        optimizer.load_state_dict(resume['optimizer'])
-        del resume
-
-    start_epoch = start_epoch + 1
+        optimizer.load_state_dict(source['optimizer'])
+    del source
     
     model_out_dir = os.path.join(out_dir, 'model')
     tb_out_dir = os.path.join(out_dir, 'runs')
@@ -179,7 +233,11 @@ def main():
     val_writer = SummaryWriter(os.path.join(tb_out_dir, 'val'))
     # writer.add_graph(net, (torch.zeros((16, 1, 128, 128, 128)).cuda(), [[]], [[]], [[]], [torch.zeros((16, 128, 128, 128))]), verbose=False)
 
-    for i in tqdm(range(start_epoch, epochs + 1), desc='Total'):
+    for i in tqdm(range(start_epoch, last_epoch + 1), desc='Total'):
+        if train_order is not None:
+            train_order.manual_seed(args.seed + i)
+            for dataset in train_dataset_list:
+                dataset.epoch = i
         # learning rate schedule
         if isinstance(optimizer, torch.optim.SGD):
             lr = lr_schdule(i, init_lr=init_lr, total=epochs)
@@ -194,7 +252,8 @@ def main():
             net.use_rcnn = False
 
         print('[epoch %d, lr %f, use_rcnn: %r]' % (i, lr, net.use_rcnn))
-        train(net, train_loader, optimizer, i, train_writer)
+        train(net, train_loader, optimizer, i, train_writer,
+              max_grad_norm=args.max_grad_norm, report_head_health=args.report_head_health)
         validate(net, val_loader, i, val_writer)
 
 
@@ -202,11 +261,12 @@ def main():
         for key in state_dict.keys():
             state_dict[key] = state_dict[key].cpu()
 
-        if i % epoch_save == 0:
+        if i % epoch_save == 0 or i == last_epoch:
             torch.save({
                 'epoch': i,
                 'out_dir': out_dir,
                 'model_config': model_cfg,
+                'training_settings': training_settings,
                 'state_dict': state_dict,
                 'optimizer' : optimizer.state_dict()},
                 os.path.join(model_out_dir, '%03d.ckpt' % i))
@@ -216,7 +276,7 @@ def main():
     val_writer.close()
 
 
-def train(net, train_loader, optimizer, epoch, writer):
+def train(net, train_loader, optimizer, epoch, writer, max_grad_norm=0., report_head_health=False):
     net.set_mode('train')
     s = time.time()
     rpn_cls_loss, rpn_reg_loss = [], []
@@ -235,11 +295,46 @@ def train(net, train_loader, optimizer, epoch, writer):
         except:
             import pdb;pdb.set_trace()
 
-        net(input, truth_box, truth_label)
+        health = {}
+        report_this_batch = report_head_health and j % 200 == 0
+        handles = install_health_hooks(net, health) if report_this_batch else []
+        try:
+            net(input, truth_box, truth_label)
+        finally:
+            for handle in handles:
+                handle.remove()
 
         loss, rpn_stat, rcnn_stat = net.loss()
+        if not torch.isfinite(loss):
+            raise RuntimeError('Non-finite loss before optimizer step at epoch %d batch %d' % (epoch, j))
         optimizer.zero_grad()
         loss.backward()
+        if report_this_batch:
+            for name, parameter in net.named_parameters():
+                if name in ('rpn.conv.0.weight', 'rcnn_head.fc1.weight', 'rcnn_head.fc2.weight'):
+                    health[name + '_grad_norm'] = float(parameter.grad.norm()) if parameter.grad is not None else None
+            probs = net.rpn_logits_flat.detach().sigmoid().reshape(-1)
+            labels_flat = net.rpn_labels.reshape(-1)
+            weights_flat = net.rpn_label_weights.reshape(-1)
+            for label, name in ((1, 'positive'), (0, 'sampled_negative')):
+                values = probs[(labels_flat == label) & (weights_flat > 0)]
+                health['rpn_' + name + '_mean_probability'] = float(values.mean()) if values.numel() else None
+            negatives = probs[(labels_flat == 0) & (weights_flat > 0)]
+            positives_count = int((labels_flat == 1).sum())
+            k = min(negatives.numel(), net.cfg['num_hard'] * positives_count)
+            hard = negatives.topk(k).values if net.cfg['num_hard'] > 0 else negatives
+            health['rpn_hard_negative_mean_probability'] = float(hard.mean()) if hard.numel() else None
+            health['rpn_hard_negative_max_probability'] = float(hard.max()) if hard.numel() else None
+            if net.use_rcnn:
+                health['rcnn_positive_samples'] = int((net.rcnn_labels > 0).sum())
+                health['rcnn_negative_samples'] = int((net.rcnn_labels == 0).sum())
+                health['rcnn_regression_target_absmax'] = float(net.rcnn_targets.abs().max()) if net.rcnn_targets.numel() else None
+        if max_grad_norm > 0:
+            norm = torch.nn.utils.clip_grad_norm_(net.parameters(), max_grad_norm, error_if_nonfinite=True)
+            if report_this_batch:
+                health['total_grad_norm_before_clip'] = float(norm)
+        if report_this_batch:
+            print('[head_health epoch=%d batch=%d] %s' % (epoch, j, json.dumps(health)))
         optimizer.step()
         # optimizer.zero_grad()
         # with torch.cuda.amp.autocast():
@@ -433,4 +528,3 @@ def print_confusion_matrix(confusion_matrix):
 
 if __name__ == '__main__':
     main()
-

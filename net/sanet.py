@@ -251,11 +251,11 @@ class SANet(nn.Module):
         # self.rpn_loss = Loss(cfg['num_hard'])
         
 
-    def forward(self, inputs, truth_boxes, truth_labels, split_combiner=None, nzhw=None):
-        # features, feat_4 = self.feature_net(inputs)
-        features, feat_4 = data_parallel(self.feature_net, (inputs))
-        fs = features[-1]
-
+    def _forward_auxiliary(self, fs):
+        if self.cfg.get('disable_auxiliary_losses', False):
+            self.mu_logvar = None
+            self.low_rank_loss_spinal = fs.new_zeros(())
+            return
         #lddg
         mu = self.mu(fs)
         logvar = self.logvar(fs)
@@ -274,7 +274,12 @@ class SANet(nn.Module):
         feature = feature[torch.randperm(len(feature))]
         U, S_spinal, V = torch.svd(feature[0:2000])
         self.low_rank_loss_spinal = S_spinal[2]
-        
+
+    def forward(self, inputs, truth_boxes, truth_labels, split_combiner=None, nzhw=None):
+        features, feat_4 = data_parallel(self.feature_net, (inputs))
+        fs = features[-1]
+        self._forward_auxiliary(fs)
+
         self.rpn_logits_flat, self.rpn_deltas_flat = data_parallel(self.rpn, fs)
         b,D,H,W,_,num_class = self.rpn_logits_flat.shape
 
@@ -342,11 +347,15 @@ class SANet(nn.Module):
                 rcnn_loss(self.rcnn_logits, self.rcnn_deltas, self.rcnn_labels, self.rcnn_targets)
     
         #lddg
-        self.loss_kl_spinal = kl_gaussian_loss(self.mu_logvar[:, 0], self.mu_logvar[:, 1])
+        self.loss_kl_spinal = (self.rpn_cls_loss.new_zeros(())
+                               if self.cfg.get('disable_auxiliary_losses', False)
+                               else kl_gaussian_loss(self.mu_logvar[:, 0], self.mu_logvar[:, 1]))
     
         self.detect_loss = self.rpn_cls_loss + self.rpn_reg_loss \
                           + self.rcnn_cls_loss +  self.rcnn_reg_loss
-        self.total_loss = self.detect_loss + self.loss_kl_spinal * cfg['kl_weight'] * 2 + self.low_rank_loss_spinal * cfg['low_rank_tradeoff']
+        self.total_loss = self.detect_loss
+        if not cfg.get('disable_auxiliary_losses', False):
+            self.total_loss = self.total_loss + self.loss_kl_spinal * cfg['kl_weight'] * 2 + self.low_rank_loss_spinal * cfg['low_rank_tradeoff']
         # self.total_loss = self.detect_loss + self.loss_kl_spinal * cfg['kl_weight'] * 2
 
     

@@ -62,6 +62,12 @@ def rpn_nms(cfg, mode, inputs, window, logits_flat, deltas_flat):
         # Only those anchor boxes larger than a pre-defined threshold
         # will be chosen for nms computation
         index = np.where(ps[:, 0] > nms_pre_score_threshold)[0]
+        # Optional bounds for patch training/validation after resetting heads.
+        # Full-scan eval/test behavior is unchanged.
+        pre_topk = cfg.get('rpn_train_pre_topk', 0) if mode in ('train', 'valid') else 0
+        post_topk = cfg.get('rpn_train_post_topk', 0) if mode in ('train', 'valid') else 0
+        if pre_topk > 0 and len(index) > pre_topk:
+            index = index[np.argsort(-ps[index, 0], kind='stable')[:pre_topk]]
         if len(index) > 0:
             p = ps[index]
             d = ds[index]
@@ -73,6 +79,8 @@ def rpn_nms(cfg, mode, inputs, window, logits_flat, deltas_flat):
 
             output = torch.from_numpy(output)
             output, keep = torch_nms(output, nms_overlap_threshold)
+            if post_topk > 0:
+                output = output[:post_topk]
 
             prop = np.zeros((len(output), 8),np.float32)
             prop[:, 0] = b

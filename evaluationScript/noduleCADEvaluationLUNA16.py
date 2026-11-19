@@ -1,5 +1,6 @@
 import os
 import math
+import json
 import sys
 import matplotlib.pyplot as plt
 plt.switch_backend('agg')
@@ -10,6 +11,7 @@ import numpy as np
 from evaluationScript.NoduleFinding import NoduleFinding
 
 from evaluationScript.tools import csvTools
+from utils.luna_eval import FROC_POINTS, sample_froc, match_distance_squared
 
 # Evaluation settings
 bPerformBootstrapping = True
@@ -51,7 +53,7 @@ def generateBootstrapSet(scanToCandidatesDict, FROCImList):
         else:
             candidates = np.concatenate((candidates,scanToCandidatesDict[im]),axis = 1)
 
-    return candidates
+    return candidates if candidatesExists else np.empty((3, 0))
 
 def compute_mean_ci(interp_sens, confidence = 0.95):
     sens_mean = np.zeros((interp_sens.shape[1]),dtype = 'float32')
@@ -128,6 +130,18 @@ def computeFROC(FROCGTList, FROCProbList, totalNumberOfImages, excludeList):
     numberOfDetectedLesions = sum(FROCGTList_local)
     totalNumberOfLesions = sum(FROCGTList)
     totalNumberOfCandidates = len(FROCProbList_local)
+    if totalNumberOfCandidates == 0:
+        return np.array([0.]), np.array([0.]), np.array([np.inf])
+    # sklearn ROC is undefined with only one class. Such cases are common
+    # for zero-detection systems and for small bootstrap samples.
+    if numberOfDetectedLesions == 0:
+        scores, counts = np.unique(FROCProbList_local, return_counts=True)
+        fps = np.r_[0., np.cumsum(counts[::-1]) / totalNumberOfImages]
+        return fps, np.zeros_like(fps), np.r_[np.inf, scores[::-1]]
+    if totalNumberOfCandidates == numberOfDetectedLesions:
+        return (np.array([0., 0.]),
+                np.array([0., numberOfDetectedLesions / totalNumberOfLesions]),
+                np.array([np.inf, min(FROCProbList_local)]))
     fpr, tpr, thresholds = skl_metrics.roc_curve(FROCGTList_local, FROCProbList_local)
     if sum(FROCGTList) == len(FROCGTList): # Handle border case when there are no false positives and ROC analysis give nan values.
       print("WARNING, this system has no false positives..")
@@ -138,7 +152,8 @@ def computeFROC(FROCGTList, FROCProbList, totalNumberOfImages, excludeList):
     return fps, sens, thresholds
 
 def evaluateCAD(seriesUIDs, results_filename, outputDir, allNodules, CADSystemName, maxNumberOfCADMarks=-1,
-                performBootstrapping=False,numberOfBootstrapSamples=1000,confidence = 0.95):
+                performBootstrapping=False,numberOfBootstrapSamples=1000,confidence = 0.95,
+                matching_rule='legacy', confusion_threshold=None):
     '''
     function to evaluate a CAD algorithm
     @param seriesUIDs: list of the seriesUIDs of the cases to be processed
@@ -148,7 +163,12 @@ def evaluateCAD(seriesUIDs, results_filename, outputDir, allNodules, CADSystemNa
     @param CADSystemName: name of the CAD system, to be used in filenames and on FROC curve
     '''
 
+    if matching_rule not in ('strict', 'legacy'):
+        raise ValueError('matching_rule must be strict or legacy')
+    if confusion_threshold is not None and not 0 <= confusion_threshold <= 1:
+        raise ValueError('confusion_threshold must be in [0, 1]')
     nodOutputfile = open(os.path.join(outputDir,'CADAnalysis.txt'),'w')
+    nodOutputfile.write('Matching rule: %s\n' % matching_rule)
     nodOutputfile.write("\n")
     nodOutputfile.write((60 * "*") + "\n")
     nodOutputfile.write("CAD Analysis: %s\n" % CADSystemName)
@@ -268,7 +288,7 @@ def evaluateCAD(seriesUIDs, results_filename, outputDir, allNodules, CADSystemNa
                 y2 = float(candidate.coordY)
                 z2 = float(candidate.coordZ)
                 dist = math.pow(x - x2, 2.) + math.pow(y - y2, 2.) + math.pow(z - z2, 2.)
-                if dist < radiusSquared+5:
+                if match_distance_squared(dist, radiusSquared, matching_rule):
                     if (noduleAnnot.state == "Included"):
                         found = True
                         noduleMatches.append(candidate)
@@ -357,6 +377,21 @@ def evaluateCAD(seriesUIDs, results_filename, outputDir, allNodules, CADSystemNa
         for i in range(len(FROCGTList)):
             f.write("%d,%.9f\n" % (FROCGTList[i], FROCProbList[i]))
 
+    if confusion_threshold is not None:
+        # The FROC vectors have one row per included nodule and per unmatched mark.
+        active = [label for label, score, missed in zip(FROCGTList, FROCProbList, excludeList)
+                  if not missed and score >= confusion_threshold]
+        tp = active.count(1)
+        fp = active.count(0)
+        fn = totalNumberOfNodules - tp
+        report = dict(unit='lesion', matching_rule=matching_rule, score_threshold=confusion_threshold,
+                      scans=len(seriesUIDs), reference_nodules=totalNumberOfNodules,
+                      TN=None, FP=fp, FN=fn, TP=tp, matrix=[[None, fp], [fn, tp]],
+                      labels=['negative', 'positive'], matrix_axes=['actual', 'predicted'])
+        with open(os.path.join(outputDir, 'confusion_matrix.json'), 'w') as f:
+            json.dump(report, f, indent=2)
+            f.write('\n')
+
     fps_itp = np.linspace(FROC_minX, FROC_maxX, num=10001)
     
     sens_itp = np.interp(fps_itp, fps, sens)
@@ -408,25 +443,15 @@ def evaluateCAD(seriesUIDs, results_filename, outputDir, allNodules, CADSystemNa
 
         plt.savefig(os.path.join(outputDir, "froc_%s.png" % CADSystemName), bbox_inches=0, dpi=300)
 
-    def find_nearest(array,value):
-        idx = np.where((array - value) == (array - value)[(array - value) >= 0].min())[0][-1]
-        return idx
-    thres = [0.125,0.25,0.5,1,2,4,8]
-    sen_boot = []
-    sen_norm = []
-    print('FROC at points: ', thres)
-    try:
-        for th in thres:
-            print('fps: ', th, ', sensitivity: ', sens[find_nearest(fps, th)])
-            sen_norm.append(sens[find_nearest(fps, th)])
-    except:
-        pass
-    try:
-        for th in thres:
-            print('fps: ', th, ', sensitivity: ', sens_bs_mean[find_nearest(fps_bs_itp, th)])
-            sen_boot.append(sens_bs_mean[find_nearest(fps_bs_itp, th)])
-    except:
-        pass
+    sen_norm = sample_froc(fps, sens)
+    sen_boot = sample_froc(fps_bs_itp, sens_bs_mean) if performBootstrapping else []
+    print('FROC at points (raw): ', FROC_POINTS.tolist())
+    for th, value in zip(FROC_POINTS, sen_norm):
+        print('fps: ', th, ', sensitivity: ', value)
+    if performBootstrapping:
+        print('FROC at points (bootstrap mean):')
+        for th, value in zip(FROC_POINTS, sen_boot):
+            print('fps: ', th, ', sensitivity: ', value)
 #         index=0
 #         for idx in range(len(fps_bs_itp)):
 #             if fps_bs_itp[idx] >= thres[index]:
@@ -434,7 +459,7 @@ def evaluateCAD(seriesUIDs, results_filename, outputDir, allNodules, CADSystemNa
 #                 index = index + 1
 #     print('=============================================\naverage FROC: ', np.mean(sen))
 #     return np.mean(sen),(fps, sens, thresholds, fps_bs_itp, sens_bs_mean, sens_bs_lb, sens_bs_up)
-    return sen_boot,np.mean(sen_boot), sen_norm, np.mean(sen_norm)
+    return sen_boot, np.mean(sen_boot) if sen_boot else float('nan'), sen_norm, np.mean(sen_norm)
     
 def getNodule(annotation, header, state = ""):
     nodule = NoduleFinding()
@@ -507,7 +532,8 @@ def collect(annotations_filename,annotations_excluded_filename,seriesuids_filena
     return (allNodules, seriesUIDs)
     
     
-def noduleCADEvaluation(annotations_filename,annotations_excluded_filename,seriesuids_filename,results_filename,outputDir):
+def noduleCADEvaluation(annotations_filename,annotations_excluded_filename,seriesuids_filename,results_filename,outputDir,
+                        matching_rule='legacy', confusion_threshold=None):
     '''
     function to load annotations and evaluate a CAD algorithm
     @param annotations_filename: list of annotations
@@ -524,7 +550,8 @@ def noduleCADEvaluation(annotations_filename,annotations_excluded_filename,serie
     sen_boot, froc_boot, sen_norm, froc_norm = evaluateCAD(seriesUIDs, results_filename, outputDir, allNodules,
                 os.path.splitext(os.path.basename(results_filename))[0],
                 maxNumberOfCADMarks=100, performBootstrapping=bPerformBootstrapping,
-                numberOfBootstrapSamples=bNumberOfBootstrapSamples, confidence=bConfidence)
+                numberOfBootstrapSamples=bNumberOfBootstrapSamples, confidence=bConfidence,
+                matching_rule=matching_rule, confusion_threshold=confusion_threshold)
     return sen_boot,froc_boot, sen_norm, froc_norm
 
 

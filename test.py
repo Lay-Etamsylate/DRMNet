@@ -3,7 +3,6 @@ import torch
 import os
 import traceback
 import time
-import nrrd
 import sys
 import matplotlib.pyplot as plt
 import logging
@@ -21,6 +20,7 @@ from dataset.collate import train_collate, test_collate, eval_collate
 from dataset.bbox_reader import BboxReader
 from config import config
 from net.model_config import VARIANTS, checkpoint_model_config
+from utils.prediction_export import export_saved_predictions
 import pandas as pd
 from evaluationScript.noduleCADEvaluationLUNA16 import noduleCADEvaluation
 
@@ -28,6 +28,8 @@ this_module = sys.modules[__name__]
 # os.environ['CUDA_VISIBLE_DEVICES'] = '0'
 
 parser = argparse.ArgumentParser()
+parser.add_argument('--inference-only', action='store_true',
+                    help='save predictions without running FROC; coordinates remain preprocessed voxels')
 parser.add_argument('--net', '-m', metavar='NET', default=config['net'],
                     help='neural net')
 parser.add_argument('--variant', choices=VARIANTS, default=None,
@@ -90,8 +92,11 @@ def main():
 #         test_loader = DataLoader(dataset, batch_size=1, shuffle=False,
 #                                  num_workers=num_workers, pin_memory=False, collate_fn=train_collate)
         eval(net, dataset, save_dir)
-        noduleCADEval(dataset, save_dir, epoch, out_dir, args.fold_num,
-                      args.froc_annotations, args.froc_excluded, args.froc_seriesuids)
+        if args.inference_only:
+            print('Predictions saved to %s (preprocessed voxel coordinates; FROC skipped)' % save_dir)
+        else:
+            noduleCADEval(dataset, save_dir, epoch, out_dir, args.fold_num,
+                          args.froc_annotations, args.froc_excluded, args.froc_seriesuids)
     else:
         logging.error('Mode %s is not supported' % (args.mode))
 
@@ -99,6 +104,10 @@ def main():
 def eval(net, dataset, save_dir):
     net.set_mode('eval')
     net.use_rcnn = True
+
+    manifest_path = os.path.join(save_dir, 'FROC', 'inference_manifest.json')
+    if os.path.exists(manifest_path):
+        os.remove(manifest_path)
 
     print('Total # of eval data %d' % (len(dataset)))
     for i, (input, truth_bboxes, truth_labels, crop_size) in enumerate(dataset):
@@ -119,29 +128,16 @@ def eval(net, dataset, save_dir):
 
 #             print('detections', detections.shape)
 
-            if len(rpns):
-                rpns = rpns[:, 1:]
-                for index in range(len(rpns)):
-                    rpns[index][1]+=crop_size[0]
-                    rpns[index][2]+=crop_size[1]
-                    rpns[index][3]+=crop_size[2]
-                np.save(os.path.join(save_dir, '%s_rpns.npy' % (pid)), rpns)
-
-            if len(detections):
-                detections = detections[:, 1:-1]
-                for index in range(len(detections)):
-                    detections[index][1]+=crop_size[0]
-                    detections[index][2]+=crop_size[1]
-                    detections[index][3]+=crop_size[2]
-                np.save(os.path.join(save_dir, '%s_rcnns.npy' % (pid)), detections)
-
-            if len(ensembles):
-                ensembles = ensembles[:, 1:]
-                for index in range(len(ensembles)):
-                    ensembles[index][1]+=crop_size[0]
-                    ensembles[index][2]+=crop_size[1]
-                    ensembles[index][3]+=crop_size[2]
-                np.save(os.path.join(save_dir, '%s_ensembles.npy' % (pid)), ensembles)
+            for kind, boxes in (('rpn', rpns[:, 1:]),
+                                ('rcnn', detections[:, 1:-1]),
+                                ('ensemble', ensembles[:, 1:])):
+                boxes = boxes.copy()
+                if len(boxes):
+                    boxes[:, 1:4] += np.asarray(crop_size)
+                else:
+                    boxes = np.empty((0, 7), dtype=np.float32)
+                # Save empty arrays too, so reruns cannot reuse stale detections.
+                np.save(os.path.join(save_dir, '%s_%ss.npy' % (pid, kind)), boxes)
 
             # Clear gpu memory
             del input, truth_bboxes, truth_labels
@@ -152,56 +148,10 @@ def eval(net, dataset, save_dir):
             torch.cuda.empty_cache()
             traceback.print_exc()
 
-            return
+            raise
     
-    # Generate prediction csv for the use of performning FROC analysis
-#     res = []
-#     for pid in dataset.filenames:
-#         if os.path.exists(os.path.join(save_dir, '%s_detections.npy' % (pid))):
-#             detections = np.load(os.path.join(save_dir, '%s_detections.npy' % (pid)))
-#             detections = detections[:, [3, 2, 1, 4, 0]]
-#             names = np.array([[pid]] * len(detections))
-#             res.append(np.concatenate([names, detections], axis=1))
-    rpn_res = []
-    rcnn_res = []
-    ensemble_res = []
-    for pid in dataset.filenames:
-        if os.path.exists(os.path.join(save_dir, '%s_rpns.npy' % (pid))):
-            rpns = np.load(os.path.join(save_dir, '%s_rpns.npy' % (pid)))
-            rpns = rpns[:, [3, 2, 1, 4, 0]]
-            names = np.array([[pid]] * len(rpns))
-            rpn_res.append(np.concatenate([names, rpns], axis=1))
+    export_saved_predictions(save_dir, dataset.filenames)
 
-        if os.path.exists(os.path.join(save_dir, '%s_rcnns.npy' % (pid))):
-            rcnns = np.load(os.path.join(save_dir, '%s_rcnns.npy' % (pid)))
-            rcnns = rcnns[:, [3, 2, 1, 4, 0]]
-            names = np.array([[pid]] * len(rcnns))
-            rcnn_res.append(np.concatenate([names, rcnns], axis=1))
-
-        if os.path.exists(os.path.join(save_dir, '%s_ensembles.npy' % (pid))):
-            ensembles = np.load(os.path.join(save_dir, '%s_ensembles.npy' % (pid)))
-            ensembles = ensembles[:, [3, 2, 1, 4, 0]]
-            names = np.array([[pid]] * len(ensembles))
-            ensemble_res.append(np.concatenate([names, ensembles], axis=1))
-    
-    rpn_res = np.concatenate(rpn_res, axis=0)
-    rcnn_res = np.concatenate(rcnn_res, axis=0)
-    ensemble_res = np.concatenate(ensemble_res, axis=0)
-    col_names = ['seriesuid','coordX','coordY','coordZ','diameter_mm', 'probability']
-    eval_dir = os.path.join(save_dir, 'FROC')
-    rpn_submission_path = os.path.join(eval_dir, 'submission_rpn.csv')
-    rcnn_submission_path = os.path.join(eval_dir, 'submission_rcnn.csv')
-    ensemble_submission_path = os.path.join(eval_dir, 'submission_ensemble.csv')
-    
-    df = pd.DataFrame(rpn_res, columns=col_names)
-    df.to_csv(rpn_submission_path, index=False)
-
-    df = pd.DataFrame(rcnn_res, columns=col_names)
-    df.to_csv(rcnn_submission_path, index=False)
-
-    df = pd.DataFrame(ensemble_res, columns=col_names)
-    df.to_csv(ensemble_submission_path, index=False)
-    
 def noduleCADEval(dataset, save_dir, epoch, out_dir, fold_num,
                   annotations_filename, annotation_exclude, val_path):
     eval_dir = os.path.join(save_dir, 'FROC')
